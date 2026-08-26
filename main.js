@@ -1,12 +1,7 @@
 /**
  * Production Multi-Provider Proxy for Deno Deploy
- * Providers: Google Gemini & Agnes AI (apihub.agnes-ai.com)
- * 
- * Strict 4-Tier Fallback Chain:
- *  1. agnes-2.5-flash
- *  2. gemini-3.5-flash-lite
- *  3. gemini-3.1-flash-lite
- *  4. gemini-3.7-flash
+ * Agnes Host: apihub.agnes-ai.com
+ * Priority: Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash
  */
 
 const kv = await Deno.openKv();
@@ -24,7 +19,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.1 Lite -> 3.7 Flash",
+    desc: "Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -70,7 +65,6 @@ const MIXED_LITE_CHAIN = [
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
-  // 1. CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -82,7 +76,6 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. 後台面板與管理 API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -90,12 +83,10 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
-  // 3. /v1/models 列表查詢
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
-  // 4. 解析請求 Body
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -108,12 +99,10 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
-  // 5. 虛擬模型 mixed-lite 階梯調度
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
-  // 6. 原生獨立模型調度
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -144,7 +133,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
       const nextStep = MIXED_LITE_CHAIN[i + 1];
       await appendLog({
         type: "failover",
-        message: `[mixed-lite] 模型 [${step.model}] 異常 (${res ? res.status : "無可用Key"}). 自動切換至 [${nextStep.model}].`,
+        message: `[mixed-lite] 模型 [${step.model}] 異常 (${res ? res.status : "無可用Key/超時"}). 自動切換至 [${nextStep.model}].`,
       });
     }
 
@@ -216,7 +205,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (usableKeys.length === 0) return null;
 
-  // 正確路徑對齊
   let targetHost = AGNES_TARGET_HOST;
   let targetPath = url.pathname;
 
@@ -227,7 +215,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     }
   } else if (provider === "gemini") {
     targetHost = GOOGLE_TARGET_HOST;
-    // 標準 OpenAI 相容端點：/v1beta/openai/chat/completions
     targetPath = "/v1beta/openai/chat/completions";
   }
 
@@ -244,12 +231,15 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
     cleanHeaders.set("Accept-Encoding", "identity");
 
+    // 針對 Agnes 採用 3.5 秒快速超時，Gemini 採用 10 秒超時
+    const timeoutMs = provider === "agnes" ? 3500 : 10000;
+
     const targetReq = new Request(targetUrl.toString(), {
       method: request.method,
       headers: cleanHeaders,
       body: bodyBuffer ? bodyBuffer.slice(0) : null,
       redirect: "follow",
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     try {
@@ -296,9 +286,12 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       });
     } catch (err) {
       await recordErrorAtomic(provider, currentKey);
+      // 連線超時或網路失敗，冷卻 120 秒避免反覆拖慢請求
+      await kv.set(["cooldown", tail], "1", { expireIn: 120000 });
+
       await appendLog({
         type: "error",
-        message: `連線至 ${targetHost} 失敗 (...${tail} - ${targetModel}): ${err.message}`,
+        message: `連線至 ${targetHost} 失敗/超時 (...${tail} - ${targetModel}): ${err.message}`,
       });
       if (i < usableKeys.length - 1) continue;
     }
@@ -462,7 +455,7 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">4-Tier Fallback</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Fast-Failover Active</span>
         </div>
         <p class="text-sm text-slate-400 mt-1">Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash</p>
       </div>
@@ -635,7 +628,7 @@ function renderAdminHTML() {
       tbody.innerHTML = pData.keys.map((k, idx) => {
         let statusBadge = '<span class="text-emerald-400 text-xs px-2.5 py-1 rounded-full bg-emerald-950/70 border border-emerald-800/80">正常 (Active)</span>';
         if (k.inCooldown) {
-          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">429 冷卻中 (60s)</span>';
+          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">冷卻中 (Cooldown)</span>';
         }
 
         const errorBadge = (k.errors > 0) 
