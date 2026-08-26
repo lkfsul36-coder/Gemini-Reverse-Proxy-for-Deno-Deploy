@@ -1,6 +1,6 @@
 # Gemini Reverse Proxy for Deno Deploy
 
-[![Deploy on Deno](https://deno.com/button)](https://console.deno.com/new?clone=https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPOSITORY_NAME)
+[![Deploy on Deno](https://deno.com/button)](https://console.deno.com/new?clone=https://github.com/lkfsul36-coder/Gemini-Reverse-Proxy-for-Deno-Deploy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Deno Deploy](https://img.shields.io/badge/Platform-Deno%20Deploy-black.svg)](https://deno.com/deploy)
 
@@ -22,9 +22,7 @@ A lightweight, serverless reverse proxy and protocol translator for Google Gemin
 
 Click the button below to fork and deploy directly to your Deno Deploy account:
 
-[![Deploy on Deno](https://deno.com/button)](https://console.deno.com/new?clone=https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPOSITORY_NAME)
-
-> **Note**: Replace `YOUR_GITHUB_USERNAME/YOUR_REPOSITORY_NAME` with your actual GitHub repository URL.
+[![Deploy on Deno](https://deno.com/button)](https://console.deno.com/new?clone=https://github.com/lkfsul36-coder/Gemini-Reverse-Proxy-for-Deno-Deploy)
 
 ---
 
