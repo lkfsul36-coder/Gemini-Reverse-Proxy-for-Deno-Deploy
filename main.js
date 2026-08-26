@@ -1,6 +1,6 @@
 /**
  * Gemini Reverse Proxy for Deno Deploy
- * Uses Google Official OpenAI Compatibility Layer + Native KV & Admin Panel
+ * Fixed: Decompression error (Z_DATA_ERROR) by disabling upstream gzip encoding
  */
 
 const kv = await Deno.openKv();
@@ -67,7 +67,6 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
-  // Route OpenAI format directly to Google's official OpenAI compat layer
   if (url.pathname.startsWith("/v1/")) {
     targetPath = "/v1beta/openai" + url.pathname;
   }
@@ -80,13 +79,14 @@ Deno.serve(async (request) => {
     const targetUrl = new URL(`https://${TARGET_HOST}${targetPath}${url.search}`);
     targetUrl.searchParams.set("key", currentKey);
 
-    // Completely clean request headers to avoid regional blocking
+    // Clean request headers and disable gzip compression from Google
     const cleanHeaders = new Headers();
     const contentType = request.headers.get("content-type");
     if (contentType) cleanHeaders.set("Content-Type", contentType);
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     cleanHeaders.set("x-goog-api-key", currentKey);
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    cleanHeaders.set("Accept-Encoding", "identity"); // Prevent Z_DATA_ERROR
 
     const targetRequest = new Request(targetUrl.toString(), {
       method: request.method,
@@ -106,6 +106,8 @@ Deno.serve(async (request) => {
       const resHeaders = new Headers(response.headers);
       resHeaders.set("Access-Control-Allow-Origin", "*");
       resHeaders.set("X-Key-Used", `...${currentKey.slice(-8)}`);
+      // Remove content-encoding header to match uncompressed stream
+      resHeaders.delete("content-encoding");
 
       if (response.ok && !url.pathname.endsWith("/models")) {
         recordUsage(currentKey, targetModel);
@@ -124,6 +126,7 @@ Deno.serve(async (request) => {
   if (lastResponse) {
     const resHeaders = new Headers(lastResponse.headers);
     resHeaders.set("Access-Control-Allow-Origin", "*");
+    resHeaders.delete("content-encoding");
     return new Response(lastResponse.body, { status: lastResponse.status, headers: resHeaders });
   }
 
@@ -240,7 +243,7 @@ function renderAdminHTML() {
           <thead class="text-slate-400 border-b border-slate-700">
             <tr><th class="py-2">Key Mask</th><th class="py-2">Today</th><th class="py-2">Total</th><th class="py-2 text-right">Actions</th></tr>
           </thead>
-          <tbody id="keyTableBody" class="divide-y divide-slate-700/50"><tr><td colspan="4" class="py-4 text-center text-slate-500">Empty</td></tr></tbody>
+          <tbody id="keyTableBody" class="divide-y divide-slate-700/50"><tr><td colspan="4" class="py-4 text-center text-slate-500">No keys.</td></tr></tbody>
         </table>
       </div>
     </div>
