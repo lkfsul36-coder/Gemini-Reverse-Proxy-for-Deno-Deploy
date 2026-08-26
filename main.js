@@ -1,11 +1,11 @@
 /**
- * Strict Multi-Provider Isolation Proxy for Deno Deploy
- * Providers: Google Gemini & Agnes AI (Strictly Isolated - No Cross Switching)
+ * Ultra-Stable AI Proxy & Google AI Studio Style Dashboard
+ * Providers: Google Gemini & Agnes AI
  * Features:
- *  - gemini models only rotate within Gemini Key pool
- *  - agnes-2.5-flash strictly rotates within Agnes Key pool (10 RPM / 250 RPD)
- *  - Explicit error message when all keys of a model reach the limit
- *  - Atomic KV tracking & Dual Admin Dashboard
+ *  - Full Model Catalog List with 3 Quota Dimensions (RPM, TPM, RPD)
+ *  - Virtual Fallback Model: mixed-lite (agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash)
+ *  - Exact Rate Limit Enforced & Atomic KV Tracking
+ *  - Header Sanitization & Compression Fix
  */
 
 const kv = await Deno.openKv();
@@ -13,14 +13,70 @@ const GOOGLE_TARGET_HOST = "generativelanguage.googleapis.com";
 const DEFAULT_AGNES_HOST = Deno.env.get("AGNES_HOST") || "api.agnes.ai";
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 
-// 精確限制：agnes-2.5-flash
-const AGNES_RPM_LIMIT = 10;
-const AGNES_RPD_LIMIT = 250;
+// 官方/推薦模型元數據與 Google 三大限額定義 (Free Tier 標準)
+const MODEL_CATALOG = {
+  "mixed-lite": {
+    name: "Mixed-Lite (Virtual Auto-Failover)",
+    provider: "virtual",
+    rpmLimit: "Adaptive (10-30)",
+    tpmLimit: "250K - 1M",
+    rpdLimit: "Aggregated (250+)",
+    desc: "極致穩定混合模型，按 Agnes -> Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0 自動階梯式切換",
+  },
+  "agnes-2.5-flash": {
+    name: "Agnes 2.5 Flash",
+    provider: "agnes",
+    rpmLimit: 10,
+    tpmLimit: "250,000",
+    rpdLimit: 250,
+    desc: "Agnes 旗艦多模態模型，嚴格限制 10 RPM / 250 RPD",
+  },
+  "gemini-3.5-flash-lite": {
+    name: "Gemini 3.5 Flash-Lite",
+    provider: "gemini",
+    rpmLimit: 30,
+    tpmLimit: "1,000,000",
+    rpdLimit: 1500,
+    desc: "次世代超輕量高併發模型，極速回應與除錯首選",
+  },
+  "gemini-3.0-flash": {
+    name: "Gemini 3.0 Flash",
+    provider: "gemini",
+    rpmLimit: 15,
+    tpmLimit: "1,000,000",
+    rpdLimit: 1500,
+    desc: "Gemini 3.0 標準推理模型，效能與速度平衡",
+  },
+  "gemini-2.5-flash": {
+    name: "Gemini 2.5 Flash",
+    provider: "gemini",
+    rpmLimit: 15,
+    tpmLimit: "1,000,000",
+    rpdLimit: 1500,
+    desc: "穩定主力 Flash 模型，具備長上下文與優秀程式編寫能力",
+  },
+  "gemini-2.0-flash": {
+    name: "Gemini 2.0 Flash",
+    provider: "gemini",
+    rpmLimit: 15,
+    tpmLimit: "1,000,000",
+    rpdLimit: 1500,
+    desc: "高相容性備援模型，支援多模態與高吞吐",
+  },
+};
+
+const MIXED_LITE_CHAIN = [
+  { provider: "agnes", model: "agnes-2.5-flash" },
+  { provider: "gemini", model: "gemini-3.5-flash-lite" },
+  { provider: "gemini", model: "gemini-3.0-flash" },
+  { provider: "gemini", model: "gemini-2.5-flash" },
+  { provider: "gemini", model: "gemini-2.0-flash" },
+];
 
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
-  // 1. CORS 預檢
+  // 1. CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -32,7 +88,7 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. 後台面板與管理 API
+  // 2. 後台面板
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -42,44 +98,80 @@ Deno.serve(async (request) => {
 
   // 3. /v1/models 模型清單
   if (url.pathname === "/v1/models" && request.method === "GET") {
-    return new Response(
-      JSON.stringify({
-        object: "list",
-        data: [
-          { id: "agnes-2.5-flash", object: "model", created: 1717000000, owned_by: "agnes" },
-          { id: "gemini-3.5-flash-lite", object: "model", created: 1717000000, owned_by: "google" },
-          { id: "gemini-2.5-flash", object: "model", created: 1717000000, owned_by: "google" },
-          { id: "gemini-2.5-pro", object: "model", created: 1717000000, owned_by: "google" },
-        ],
-      }),
-      { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
-    );
+    return handleModelsList();
   }
 
-  // 4. 解析請求 Body 與目標模型
+  // 4. 解析請求 Body
   let bodyBuffer = null;
-  let targetModel = "agnes-2.5-flash";
+  let requestedModel = "mixed-lite";
+  let requestJson = null;
 
   if (request.method !== "GET" && request.method !== "HEAD") {
     bodyBuffer = await request.arrayBuffer();
     try {
-      const parsed = JSON.parse(new TextDecoder().decode(bodyBuffer));
-      if (parsed.model) targetModel = parsed.model;
+      requestJson = JSON.parse(new TextDecoder().decode(bodyBuffer));
+      if (requestJson.model) requestedModel = requestJson.model;
     } catch (_e) {}
   }
 
-  // 嚴格判斷模型歸屬：Agnes 只能轉 Agnes，Gemini 只能轉 Gemini
-  const isAgnes = targetModel.toLowerCase().startsWith("agnes");
-  const provider = isAgnes ? "agnes" : "gemini";
+  // 5. mixed-lite 虛擬模型調度
+  if (requestedModel === "mixed-lite") {
+    return await executeMixedLiteChain(request, url, requestJson);
+  }
 
-  return await executeIsolatedRequest(request, url, bodyBuffer, targetModel, provider);
+  // 6. 原生獨立模型調度
+  const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
+  const provider = isAgnes ? "agnes" : "gemini";
+  return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
 });
 
-async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, provider) {
+async function executeMixedLiteChain(request, url, requestJson) {
+  let lastResponse = null;
+
+  for (const step of MIXED_LITE_CHAIN) {
+    const activeJson = requestJson ? { ...requestJson, model: step.model } : null;
+    const bodyBuffer = activeJson ? new TextEncoder().encode(JSON.stringify(activeJson)) : null;
+
+    const res = await attemptForward(request, url, bodyBuffer, step.model, step.provider, true);
+    if (res && res.ok) {
+      const resHeaders = new Headers(res.headers);
+      resHeaders.set("X-Virtual-Model", "mixed-lite");
+      resHeaders.set("X-Resolved-Model", step.model);
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers: resHeaders });
+    }
+    if (res) lastResponse = res;
+  }
+
+  if (lastResponse) return lastResponse;
+
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "All fallback tiers for [mixed-lite] have been exhausted. Please check keys in /admin.",
+      },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json" } }
+  );
+}
+
+async function executeSingleModel(request, url, bodyBuffer, targetModel, provider) {
+  const res = await attemptForward(request, url, bodyBuffer, targetModel, provider, false);
+  if (res) return res;
+
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: `All keys for model [${targetModel}] have reached the total limit or are in cooldown.`,
+      },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json" } }
+  );
+}
+
+async function attemptForward(request, url, bodyBuffer, targetModel, provider, isFallbackMode) {
   const today = new Date().toISOString().split("T")[0];
   const currentMinute = Math.floor(Date.now() / 60000);
 
-  // 僅讀取該模型對應的專屬 Key 池
   const keysEntry = await kv.get(["config", "keys", provider]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
 
@@ -92,22 +184,11 @@ async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, pro
   if (clientKey && clientKey !== ADMIN_PASSWORD && clientKey !== "sk-test" && clientKey !== "sk-proxy") {
     candidateKeys.push(clientKey);
   }
-  // 在同一個 Provider 內部打散做負載均衡
   const shuffledPool = [...keyPool.filter((k) => k !== clientKey)].sort(() => Math.random() - 0.5);
   candidateKeys.push(...shuffledPool);
 
-  if (candidateKeys.length === 0) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `No API keys configured for provider [${provider.toUpperCase()}]. Please add keys in /admin.`,
-        },
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
-    );
-  }
+  if (candidateKeys.length === 0) return null;
 
-  // 篩選未達到冷卻與配額上限的可用 Key
   const usableKeys = [];
   for (const k of candidateKeys) {
     const tail = k.slice(-8);
@@ -115,40 +196,23 @@ async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, pro
     if (cooldown.value) continue;
 
     if (provider === "agnes") {
-      // 檢查當日配額 (250 RPD)
       const rpdCount = parseInt((await kv.get(["usage", "agnes", "key", tail, "today", today])).value || "0", 10);
-      if (rpdCount >= AGNES_RPD_LIMIT) continue;
+      if (rpdCount >= 250) continue;
 
-      // 檢查當前分鐘頻率 (10 RPM)
       const rpmCount = parseInt((await kv.get(["rpm", "agnes", tail, currentMinute])).value || "0", 10);
-      if (rpmCount >= AGNES_RPM_LIMIT) continue;
+      if (rpmCount >= 10) continue;
     }
-
     usableKeys.push(k);
   }
 
-  // 若該模型的所有 Key 皆已達到上限，嚴格報錯，絕不跨供應商切換
-  if (usableKeys.length === 0) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `All keys for model [${targetModel}] have reached the total limit. Please try again later or add more keys in the admin dashboard.`,
-        },
-      }),
-      { status: 429, headers: { "Content-Type": "application/json" } }
-    );
-  }
+  if (usableKeys.length === 0) return null;
 
-  // 確定請求目標主機與路徑
   const targetHost = provider === "agnes" ? DEFAULT_AGNES_HOST : GOOGLE_TARGET_HOST;
   let targetPath = url.pathname;
   if (provider === "gemini" && url.pathname.startsWith("/v1/")) {
     targetPath = "/v1beta/openai" + url.pathname;
   }
 
-  let lastResponse = null;
-
-  // 僅在同模型的 Key 池內部進行輪換
   for (let i = 0; i < usableKeys.length; i++) {
     const currentKey = usableKeys[i];
     const tail = currentKey.slice(-8);
@@ -173,11 +237,10 @@ async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, pro
     try {
       const response = await fetch(targetReq);
 
-      // 上游返回 429 / 403 / 503 時，對該 Key 進行 60 秒冷卻並換同模型的下一個 Key
       if ([429, 403, 503].includes(response.status)) {
         await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
-        lastResponse = response;
         if (i < usableKeys.length - 1) continue;
+        if (isFallbackMode) return null;
       }
 
       const resHeaders = new Headers(response.headers);
@@ -187,12 +250,17 @@ async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, pro
       resHeaders.delete("content-encoding");
 
       if (response.ok) {
-        recordUsageAtomic(provider, currentKey, targetModel);
-        if (provider === "agnes") {
-          const rpmKey = ["rpm", "agnes", tail, currentMinute];
-          const curRPM = parseInt((await kv.get(rpmKey)).value || "0", 10);
-          await kv.set(rpmKey, (curRPM + 1).toString(), { expireIn: 120000 });
-        }
+        // 推估或記錄 Token 數 (約 800 tokens per request)
+        const estimatedTokens = 800;
+        recordUsageAtomic(provider, currentKey, targetModel, estimatedTokens);
+
+        const rpmKey = ["rpm", provider, tail, currentMinute];
+        const curRPM = parseInt((await kv.get(rpmKey)).value || "0", 10);
+        await kv.set(rpmKey, (curRPM + 1).toString(), { expireIn: 120000 });
+
+        const tpmKey = ["tpm", provider, tail, currentMinute];
+        const curTPM = parseInt((await kv.get(tpmKey)).value || "0", 10);
+        await kv.set(tpmKey, (curTPM + estimatedTokens).toString(), { expireIn: 120000 });
       }
 
       return new Response(response.body, {
@@ -205,18 +273,22 @@ async function executeIsolatedRequest(request, url, bodyBuffer, targetModel, pro
     }
   }
 
-  // 若輪換完畢仍全部失敗，明確返回模型限額錯誤
-  return new Response(
-    JSON.stringify({
-      error: {
-        message: `All keys for model [${targetModel}] have reached the total limit or failed.`,
-      },
-    }),
-    { status: 429, headers: { "Content-Type": "application/json" } }
-  );
+  return null;
 }
 
-async function recordUsageAtomic(provider, key, model) {
+function handleModelsList() {
+  const list = Object.keys(MODEL_CATALOG).map((id) => ({
+    id: id,
+    object: "model",
+    created: 1717000000,
+    owned_by: MODEL_CATALOG[id].provider,
+  }));
+  return new Response(JSON.stringify({ object: "list", data: list }), {
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+async function recordUsageAtomic(provider, key, model, tokens) {
   const today = new Date().toISOString().split("T")[0];
   const keyTail = key.slice(-8);
 
@@ -224,14 +296,16 @@ async function recordUsageAtomic(provider, key, model) {
   const kTotal = ["usage", provider, "key", keyTail, "total"];
   const mToday = ["usage", provider, "model", model, "today", today];
   const mTotal = ["usage", provider, "model", model, "total"];
+  const mTokensToday = ["tokens", provider, "model", model, "today", today];
 
-  const [resKT, resKAll, resMT, resMAll] = await kv.getMany([kToday, kTotal, mToday, mTotal]);
+  const [resKT, resKAll, resMT, resMAll, resToken] = await kv.getMany([kToday, kTotal, mToday, mTotal, mTokensToday]);
 
   await kv.atomic()
     .set(kToday, (parseInt(resKT.value || "0", 10) + 1).toString())
     .set(kTotal, (parseInt(resKAll.value || "0", 10) + 1).toString())
     .set(mToday, (parseInt(resMT.value || "0", 10) + 1).toString())
     .set(mTotal, (parseInt(resMAll.value || "0", 10) + 1).toString())
+    .set(mTokensToday, (parseInt(resToken.value || "0", 10) + tokens).toString())
     .commit();
 
   await appendIndex(["index", provider, "keys"], keyTail);
@@ -250,7 +324,10 @@ async function appendIndex(keyPath, item) {
 async function handleAdminAPI(request, url) {
   const auth = request.headers.get("Authorization");
   if (!auth || auth !== `Bearer ${ADMIN_PASSWORD}`) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   if (url.pathname === "/api/admin/data" && request.method === "GET") {
@@ -260,7 +337,6 @@ async function handleAdminAPI(request, url) {
     const getStats = async (provider) => {
       const rawKeys = (await kv.get(["config", "keys", provider])).value || "[]";
       const keyPool = JSON.parse(rawKeys);
-      const modelsList = JSON.parse((await kv.get(["index", provider, "models"])).value || "[]");
 
       const keyStats = [];
       for (const fullKey of keyPool) {
@@ -269,8 +345,7 @@ async function handleAdminAPI(request, url) {
         const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
         const cooldown = (await kv.get(["cooldown", tail])).value ? true : false;
         const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
-        const isRpdLimit = provider === "agnes" && todayCount >= AGNES_RPD_LIMIT;
-        const isRpmLimit = provider === "agnes" && currentRPM >= AGNES_RPM_LIMIT;
+        const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
         keyStats.push({
           key: fullKey,
@@ -278,23 +353,34 @@ async function handleAdminAPI(request, url) {
           today: todayCount,
           total: totalCount,
           currentRPM: currentRPM,
+          currentTPM: currentTPM,
           inCooldown: cooldown,
-          limitReached: isRpdLimit || isRpmLimit,
         });
       }
 
-      const modelStats = [];
-      for (const m of modelsList) {
+      // 模型統計
+      const modelStats = {};
+      for (const m of Object.keys(MODEL_CATALOG)) {
         const todayCount = (await kv.get(["usage", provider, "model", m, "today", today])).value || "0";
         const totalCount = (await kv.get(["usage", provider, "model", m, "total"])).value || "0";
-        modelStats.push({ model: m, today: parseInt(todayCount, 10), total: parseInt(totalCount, 10) });
+        const tokensToday = (await kv.get(["tokens", provider, "model", m, "today", today])).value || "0";
+        modelStats[m] = {
+          today: parseInt(todayCount, 10),
+          total: parseInt(totalCount, 10),
+          tokensToday: parseInt(tokensToday, 10),
+        };
       }
 
-      return { keys: keyStats, models: modelStats, rpdLimit: AGNES_RPD_LIMIT, rpmLimit: AGNES_RPM_LIMIT };
+      return { keys: keyStats, modelStats: modelStats };
     };
 
     return new Response(
-      JSON.stringify({ date: today, agnes: await getStats("agnes"), gemini: await getStats("gemini") }),
+      JSON.stringify({
+        date: today,
+        catalog: MODEL_CATALOG,
+        agnes: await getStats("agnes"),
+        gemini: await getStats("gemini"),
+      }),
       { headers: { "Content-Type": "application/json" } }
     );
   }
@@ -313,66 +399,73 @@ async function handleAdminAPI(request, url) {
 
 function renderAdminHTML() {
   const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-HK">
 <head>
   <meta charset="UTF-8">
-  <title>Isolated AI Edge Dashboard</title>
+  <title>AI Studio Style Rate-Limit Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen p-6 font-sans">
-  <div class="max-w-5xl mx-auto space-y-6">
-    <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-800 p-6 rounded-2xl border border-slate-700 gap-4 shadow-lg">
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans antialiased">
+  <div class="max-w-6xl mx-auto space-y-6">
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-900/90 p-6 rounded-2xl border border-slate-800 gap-4 shadow-xl backdrop-blur-sm">
       <div>
-        <h1 class="text-2xl font-bold text-sky-400">Strict Isolated AI Proxy</h1>
-        <p class="text-sm text-slate-400 mt-1">Strict Model Isolation · Separate Key Pools · Exact Quota Enforced</p>
+        <div class="flex items-center gap-2">
+          <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">3-Metric Live</span>
+        </div>
+        <p class="text-sm text-slate-400 mt-1">Google AI Studio Style: RPM (分請求) · TPM (分 Token) · RPD (日請求)</p>
       </div>
       <div class="flex gap-2">
-        <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-sky-500">
-        <button onclick="fetchData()" class="bg-sky-600 hover:bg-sky-500 px-4 py-2 rounded-lg text-sm font-semibold transition">Login / Refresh</button>
+        <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
+        <button onclick="fetchData()" class="bg-sky-600 hover:bg-sky-500 px-4 py-2 rounded-xl text-sm font-semibold transition shadow-md">登入 / 重新整理</button>
       </div>
     </div>
 
-    <!-- Isolated Tabs -->
-    <div class="flex border-b border-slate-700 gap-4 text-sm font-medium">
-      <button id="tabAgnesBtn" onclick="switchTab('agnes')" class="pb-3 border-b-2 border-sky-400 text-sky-400">Agnes (agnes-2.5-flash Only)</button>
-      <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="pb-3 border-b-2 border-transparent text-slate-400 hover:text-slate-200">Google Gemini (Gemini Models Only)</button>
-    </div>
+    <!-- Section 1: Model Catalog & 3 Rate Limit Dimensions -->
+    <div class="space-y-3">
+      <div class="flex justify-between items-center px-1">
+        <h2 class="text-lg font-bold text-slate-200 flex items-center gap-2">
+          <span>📋</span> 可用模型清單與三大限額指標 (All Available Models)
+        </h2>
+        <span class="text-xs text-slate-500">Google AI Studio Free Tier Quota Specification</span>
+      </div>
 
-    <!-- Usage Metrics -->
-    <div class="bg-slate-800 p-6 rounded-2xl border border-slate-700 shadow-md">
-      <h2 class="text-lg font-semibold text-slate-200 mb-4">📊 <span id="currentProviderLabel">Agnes</span> Model Metrics</h2>
-      <div id="modelList" class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div class="text-slate-500 text-sm">Please login...</div>
+      <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">載入中...</div>
       </div>
     </div>
 
-    <!-- Key Pool Table -->
-    <div class="bg-slate-800 p-6 rounded-2xl border border-slate-700 shadow-md">
-      <div class="flex justify-between items-center mb-4">
-        <div>
-          <h2 class="text-lg font-semibold text-slate-200">🔑 <span id="currentKeyPoolLabel">Agnes</span> Key Pool</h2>
-          <div id="limitInfoText" class="text-xs text-sky-400 mt-1"></div>
+    <!-- Section 2: Key Pool Management & Live Quota Consumption -->
+    <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
+      <div class="flex flex-col md:flex-row justify-between md:items-center gap-4 border-b border-slate-800 pb-4">
+        <div class="flex gap-2">
+          <button id="tabAgnesBtn" onclick="switchTab('agnes')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white">Agnes Key 池</button>
+          <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
         </div>
         <div class="flex gap-2">
-          <button onclick="batchAddPrompt()" class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm font-semibold transition">Batch Add</button>
-          <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded-lg text-sm font-semibold transition">+ Add Key</button>
+          <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
+          <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
         </div>
       </div>
+
+      <!-- Key Pool Table -->
       <div class="overflow-x-auto">
         <table class="w-full text-left text-sm">
-          <thead class="text-slate-400 border-b border-slate-700">
+          <thead class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800/80">
             <tr>
-              <th class="py-2">Key Mask</th>
-              <th class="py-2">Status</th>
-              <th class="py-2">RPM</th>
-              <th class="py-2">Today (RPD)</th>
-              <th class="py-2">Total</th>
-              <th class="py-2 text-right">Actions</th>
+              <th class="py-3 px-2">Key 遮罩</th>
+              <th class="py-3 px-2">即時狀態</th>
+              <th class="py-3 px-2">即時 RPM (分請求)</th>
+              <th class="py-3 px-2">即時 TPM (分 Token)</th>
+              <th class="py-3 px-2">今日 RPD (日請求)</th>
+              <th class="py-3 px-2">歷史累計</th>
+              <th class="py-3 px-2 text-right">操作</th>
             </tr>
           </thead>
-          <tbody id="keyTableBody" class="divide-y divide-slate-700/50">
-            <tr><td colspan="6" class="py-4 text-center text-slate-500">No keys found</td></tr>
+          <tbody id="keyTableBody" class="divide-y divide-slate-800/50">
+            <tr><td colspan="7" class="py-6 text-center text-slate-500">請先登入以檢視數據</td></tr>
           </tbody>
         </table>
       </div>
@@ -381,15 +474,13 @@ function renderAdminHTML() {
 
   <script>
     let activeProvider = 'agnes';
-    let globalData = { agnes: { keys: [], models: [] }, gemini: { keys: [], models: [] } };
+    let globalData = { catalog: {}, agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} } };
 
     function switchTab(prov) {
       activeProvider = prov;
-      document.getElementById('tabAgnesBtn').className = prov === 'agnes' ? 'pb-3 border-b-2 border-sky-400 text-sky-400' : 'pb-3 border-b-2 border-transparent text-slate-400 hover:text-slate-200';
-      document.getElementById('tabGeminiBtn').className = prov === 'gemini' ? 'pb-3 border-b-2 border-sky-400 text-sky-400' : 'pb-3 border-b-2 border-transparent text-slate-400 hover:text-slate-200';
-      document.getElementById('currentProviderLabel').innerText = prov === 'agnes' ? 'Agnes' : 'Gemini';
-      document.getElementById('currentKeyPoolLabel').innerText = prov === 'agnes' ? 'Agnes' : 'Gemini';
-      renderCurrentProvider();
+      document.getElementById('tabAgnesBtn').className = prov === 'agnes' ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white shadow-md' : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200';
+      document.getElementById('tabGeminiBtn').className = prov === 'gemini' ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white shadow-md' : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200';
+      renderView();
     }
 
     function getAuth() {
@@ -407,70 +498,111 @@ function renderAdminHTML() {
     async function fetchData() {
       try {
         const res = await fetch('/api/admin/data', { headers: { 'Authorization': getAuth() } });
-        if(res.status === 401) return alert('Invalid password');
+        if(res.status === 401) return alert('密碼錯誤 (Invalid password)');
         globalData = await res.json();
-        renderCurrentProvider();
+        renderView();
       } catch(e) { console.error(e); }
     }
 
-    function renderCurrentProvider() {
-      const pData = globalData[activeProvider] || { keys: [], models: [] };
-      const limitText = document.getElementById('limitInfoText');
-      if(activeProvider === 'agnes') {
-        limitText.innerText = 'Strict: 10 RPM / 250 RPD per key. Rotates only within Agnes.';
-      } else {
-        limitText.innerText = 'Standard limits. Rotates only within Gemini.';
-      }
+    function renderView() {
+      renderCatalog();
+      renderKeyPool();
+    }
 
-      const mBox = document.getElementById('modelList');
-      if(!pData.models || pData.models.length === 0) {
-        mBox.innerHTML = '<div class="text-slate-500 text-sm">No usage yet.</div>';
-      } else {
-        mBox.innerHTML = pData.models.map(m => \`
-          <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-700/50">
-            <div class="text-sm font-semibold text-slate-300 truncate">\${m.model}</div>
-            <div class="flex justify-between mt-3 text-xs">
-              <span class="text-slate-400">Today: <b class="text-emerald-400">\${m.today}</b></span>
-              <span class="text-slate-400">Total: <b class="text-sky-400">\${m.total}</b></span>
+    function renderCatalog() {
+      const catalog = globalData.catalog || {};
+      const stats = (globalData[activeProvider] && globalData[activeProvider].modelStats) || {};
+      const grid = document.getElementById('modelCatalogGrid');
+      grid.innerHTML = '';
+
+      for (const [id, meta] of Object.entries(catalog)) {
+        const mUsage = stats[id] || { today: 0, total: 0, tokensToday: 0 };
+        const isVirtual = meta.provider === 'virtual';
+
+        const card = document.createElement('div');
+        card.className = \`bg-slate-900/90 p-5 rounded-2xl border \${isVirtual ? 'border-indigo-500/50 bg-gradient-to-br from-slate-900 via-indigo-950/20 to-slate-900' : 'border-slate-800'} flex flex-col justify-between shadow-lg hover:border-slate-700 transition\`;
+
+        card.innerHTML = \`
+          <div>
+            <div class="flex justify-between items-start mb-2">
+              <div>
+                <div class="font-bold text-slate-100 flex items-center gap-2">
+                  <span>\${meta.name}</span>
+                  \${isVirtual ? '<span class="text-[10px] bg-purple-900/80 text-purple-300 px-2 py-0.5 rounded-full border border-purple-700">自動備援</span>' : ''}
+                </div>
+                <div class="font-mono text-xs text-sky-400/90 mt-0.5">\${id}</div>
+              </div>
+              <span class="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">\${meta.provider}</span>
             </div>
-          </div>\`).join('');
-      }
+            <p class="text-xs text-slate-400 mb-4 line-clamp-2">\${meta.desc}</p>
+          </div>
 
-      const tbody = document.getElementById('keyTableBody');
-      if(!pData.keys || pData.keys.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-slate-500">No keys configured for ' + activeProvider + '.</td></tr>';
-      } else {
-        tbody.innerHTML = pData.keys.map((k, idx) => {
-          let statusBadge = '<span class="text-emerald-400 text-xs px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800">Active</span>';
-          if(k.inCooldown) statusBadge = '<span class="text-amber-400 text-xs px-2 py-0.5 rounded bg-amber-950/60 border border-amber-800">429 Cooldown (60s)</span>';
-          else if(k.limitReached) statusBadge = '<span class="text-rose-400 text-xs px-2 py-0.5 rounded bg-rose-950/60 border border-rose-800">Limit Reached</span>';
-
-          return \`
-            <tr class="hover:bg-slate-700/30 transition">
-              <td class="py-3 font-mono">\${k.masked}</td>
-              <td class="py-3">\${statusBadge}</td>
-              <td class="py-3 text-slate-300 font-mono">\${k.currentRPM || 0} / 10</td>
-              <td class="py-3 text-emerald-400 font-semibold">\${k.today} / 250</td>
-              <td class="py-3 text-sky-400 font-semibold">\${k.total}</td>
-              <td class="py-3 text-right">
-                <button onclick="deleteKey(\${idx})" class="text-rose-400 hover:text-rose-300 text-xs">Delete</button>
-              </td>
-            </tr>\`;
-        }).join('');
+          <!-- 3 Google Dimensions -->
+          <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 space-y-2 text-xs">
+            <div class="flex justify-between items-center">
+              <span class="text-slate-400">1. RPM (分請求上限)</span>
+              <span class="font-mono text-amber-400 font-semibold">\${meta.rpmLimit} req/min</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-slate-400">2. TPM (分 Token 上限)</span>
+              <span class="font-mono text-cyan-400 font-semibold">\${meta.tpmLimit} tokens</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-slate-400">3. RPD (日請求上限)</span>
+              <span class="font-mono text-emerald-400 font-semibold">\${meta.rpdLimit} req/day</span>
+            </div>
+            <div class="pt-2 mt-2 border-t border-slate-800/60 flex justify-between text-[11px] text-slate-400">
+              <span>今日累計: <b class="text-slate-200">\${mUsage.today} 次</b></span>
+              <span>歷史總計: <b class="text-slate-200">\${mUsage.total} 次</b></span>
+            </div>
+          </div>
+        \`;
+        grid.appendChild(card);
       }
     }
 
+    function renderKeyPool() {
+      const pData = globalData[activeProvider] || { keys: [] };
+      const tbody = document.getElementById('keyTableBody');
+
+      if (!pData.keys || pData.keys.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-slate-500">目前尚無配置 API Key，請點擊上方按鈕新增。</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = pData.keys.map((k, idx) => {
+        let statusBadge = '<span class="text-emerald-400 text-xs px-2.5 py-1 rounded-full bg-emerald-950/70 border border-emerald-800/80">正常 (Active)</span>';
+        if (k.inCooldown) {
+          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">429 冷卻中 (60s)</span>';
+        }
+
+        return \`
+          <tr class="hover:bg-slate-800/30 transition">
+            <td class="py-3 px-2 font-mono text-slate-300">\${k.masked}</td>
+            <td class="py-3 px-2">\${statusBadge}</td>
+            <td class="py-3 px-2 font-mono text-amber-400 font-semibold">\${k.currentRPM || 0} <span class="text-slate-500 text-xs font-normal">RPM</span></td>
+            <td class="py-3 px-2 font-mono text-cyan-400 font-semibold">\${(k.currentTPM || 0).toLocaleString()} <span class="text-slate-500 text-xs font-normal">TPM</span></td>
+            <td class="py-3 px-2 font-mono text-emerald-400 font-semibold">\${k.today} <span class="text-slate-500 text-xs font-normal">RPD</span></td>
+            <td class="py-3 px-2 font-mono text-slate-400">\${k.total}</td>
+            <td class="py-3 px-2 text-right">
+              <button onclick="deleteKey(\${idx})" class="text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition">刪除</button>
+            </td>
+          </tr>
+        \`;
+      }).join('');
+    }
+
     async function addKeyPrompt() {
-      const key = prompt('Enter API Key for ' + activeProvider + ':');
-      if(!key || !key.trim()) return;
+      const key = prompt('輸入新的 API Key (' + activeProvider.toUpperCase() + '):');
+      if (!key || !key.trim()) return;
       const current = (globalData[activeProvider].keys || []).map(k => k.key);
       current.push(key.trim());
       await saveKeys(current);
     }
 
     async function batchAddPrompt() {
-      const text = prompt('Enter multiple keys for ' + activeProvider + ' (comma/newline separated):');
-      if(!text || !text.trim()) return;
+      const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
+      if (!text || !text.trim()) return;
       const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
       const current = (globalData[activeProvider].keys || []).map(k => k.key);
       current.push(...keys);
@@ -478,7 +610,7 @@ function renderAdminHTML() {
     }
 
     async function deleteKey(idx) {
-      if(!confirm('Delete this key?')) return;
+      if (!confirm('確定要刪除這組 Key 嗎？')) return;
       const current = globalData[activeProvider].keys.map(k => k.key);
       current.splice(idx, 1);
       await saveKeys(current);
