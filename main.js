@@ -1,12 +1,10 @@
 /**
- * Ultra-Stable Multi-Provider AI Proxy
- * Providers: Agnes AI (apihub.agnes-ai.com) & Google Gemini
- * 
- * Strict 4-Tier Fallback Chain:
- *  1. agnes-2.5-flash
- *  2. gemini-3.5-flash-lite
- *  3. gemini-3.1-flash-lite
- *  4. gemini-3.7-flash
+ * Ultra-Stable Multi-Provider AI Proxy with Auto-Expiring Cooldown
+ * Features:
+ *  - Auto-clearing Cooldown (Timestamp-based 60s auto-unlock)
+ *  - Per-Model & Per-Key Enable/Disable Toggle
+ *  - mixed-lite auto-skips disabled models and disabled keys
+ *  - Deno KV Persisted Config
  */
 
 const kv = await Deno.openKv();
@@ -16,6 +14,7 @@ const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 
 const AGNES_RPM_LIMIT = 10;
 const AGNES_RPD_LIMIT = 250;
+const COOLDOWN_DURATION_MS = 60000; // 60秒自動解除冷卻
 
 const MODEL_CATALOG = {
   "mixed-lite": {
@@ -24,7 +23,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.1 Lite -> 3.7 Flash",
+    desc: "自動跳過已禁用或冷卻中的模型，於啟用模型中階梯降級備援",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -67,6 +66,28 @@ const MIXED_LITE_CHAIN = [
   { provider: "gemini", model: "gemini-3.7-flash" },
 ];
 
+async function isModelDisabled(modelId) {
+  const res = await kv.get(["config", "disabled_models"]);
+  const list = res.value ? JSON.parse(res.value) : [];
+  return list.includes(modelId);
+}
+
+// 檢查並自動清理冷卻狀態
+async function checkAndCleanCooldown(keyTail) {
+  const cooldownRes = await kv.get(["cooldown", keyTail]);
+  if (!cooldownRes.value) return false;
+
+  const expireTime = parseInt(cooldownRes.value, 10);
+  const now = Date.now();
+
+  if (now >= expireTime) {
+    // 時間已過，自動刪除冷卻
+    await kv.delete(["cooldown", keyTail]);
+    return false;
+  }
+  return true; // 仍在冷卻中
+}
+
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
@@ -108,6 +129,13 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
+  if (requestedModel !== "mixed-lite" && await isModelDisabled(requestedModel)) {
+    return new Response(
+      JSON.stringify({ error: { message: `Model [${requestedModel}] has been disabled by administrator.` } }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   // 5. 虛擬模型 mixed-lite 階梯調度
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
@@ -121,9 +149,16 @@ Deno.serve(async (request) => {
 
 async function executeMixedLiteChain(request, url, requestJson) {
   let lastResponse = null;
+  const resDisabled = await kv.get(["config", "disabled_models"]);
+  const disabledList = resDisabled.value ? JSON.parse(resDisabled.value) : [];
 
   for (let i = 0; i < MIXED_LITE_CHAIN.length; i++) {
     const step = MIXED_LITE_CHAIN[i];
+
+    if (disabledList.includes(step.model)) {
+      continue;
+    }
+
     let activeBuffer = null;
     if (requestJson) {
       const cloned = JSON.parse(JSON.stringify(requestJson));
@@ -140,13 +175,10 @@ async function executeMixedLiteChain(request, url, requestJson) {
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers: resHeaders });
     }
 
-    if (i < MIXED_LITE_CHAIN.length - 1) {
-      const nextStep = MIXED_LITE_CHAIN[i + 1];
-      await appendLog({
-        type: "failover",
-        message: `[mixed-lite] 模型 [${step.model}] 失敗/限流 (${res ? res.status : "冷卻中/超時"}). 自動切換至 [${nextStep.model}].`,
-      });
-    }
+    await appendLog({
+      type: "failover",
+      message: `[mixed-lite] 模型 [${step.model}] 異常 (${res ? res.status : "冷卻中/超時"}). 自動嘗試下一順位可用模型.`,
+    });
 
     if (res) lastResponse = res;
   }
@@ -155,13 +187,13 @@ async function executeMixedLiteChain(request, url, requestJson) {
 
   await appendLog({
     type: "exhausted",
-    message: `[mixed-lite] 全部 4 級模型皆已耗盡或無法連線！`,
+    message: `[mixed-lite] 所有已啟用的備援模型皆已耗盡或無法連線！`,
   });
 
   return new Response(
     JSON.stringify({
       error: {
-        message: "All fallback tiers for [mixed-lite] have reached limit or failed. Please check keys in /admin.",
+        message: "All active fallback tiers for [mixed-lite] have reached limit or are disabled. Please check /admin.",
       },
     }),
     { status: 429, headers: { "Content-Type": "application/json" } }
@@ -194,15 +226,20 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
   const keysEntry = await kv.get(["config", "keys", provider]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
 
+  const disabledKeysEntry = await kv.get(["config", "disabled_keys", provider]);
+  const disabledKeys = disabledKeysEntry.value ? JSON.parse(disabledKeysEntry.value) : [];
+
   if (keyPool.length === 0) return null;
 
   const candidateKeys = [...keyPool].sort(() => Math.random() - 0.5);
   const usableKeys = [];
 
   for (const k of candidateKeys) {
+    if (disabledKeys.includes(k)) continue;
+
     const tail = k.slice(-8);
-    const cooldown = await kv.get(["cooldown", tail]);
-    if (cooldown.value) continue;
+    const isInCooldown = await checkAndCleanCooldown(tail);
+    if (isInCooldown) continue;
 
     if (provider === "agnes") {
       const rpdCount = parseInt((await kv.get(["usage", "agnes", "key", tail, "today", today])).value || "0", 10);
@@ -237,16 +274,13 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     cleanHeaders.set("Content-Type", "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
-    
-    // 嚴格偽裝標準桌面端請求，防止被 WAF 直接阻擋/丟包
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
     cleanHeaders.set("Accept", "application/json, text/plain, */*");
     cleanHeaders.set("Accept-Language", "en-US,en;q=0.9");
     cleanHeaders.set("Origin", "https://platform.agnes-ai.com");
     cleanHeaders.set("Referer", "https://platform.agnes-ai.com/");
 
-    // Agnes 設定 8 秒超時，Gemini 設定 15 秒超時
-    const timeoutMs = provider === "agnes" ? 8000 : 15000;
+    const timeoutMs = provider === "agnes" ? 6000 : 15000;
 
     const targetReq = new Request(targetUrl.toString(), {
       method: "POST",
@@ -261,11 +295,12 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
       if ([400, 401, 403, 404, 429, 500, 502, 503, 504].includes(response.status)) {
         await recordErrorAtomic(provider, currentKey);
-        await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
+        // 設定精確 60 秒冷卻戳記
+        await kv.set(["cooldown", tail], (Date.now() + COOLDOWN_DURATION_MS).toString());
 
         await appendLog({
           type: "error",
-          message: `Key [...${tail}] 在 [${targetModel}] 觸發 HTTP ${response.status}。進入 60 秒冷卻。`,
+          message: `Key [...${tail}] 在 [${targetModel}] 觸發 HTTP ${response.status}。進入 60 秒自動冷卻。`,
         });
 
         if (i < usableKeys.length - 1) continue;
@@ -300,7 +335,8 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       });
     } catch (err) {
       await recordErrorAtomic(provider, currentKey);
-      await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
+      // 網路或超時錯誤，自動冷卻 60 秒
+      await kv.set(["cooldown", tail], (Date.now() + COOLDOWN_DURATION_MS).toString());
 
       await appendLog({
         type: "error",
@@ -380,9 +416,15 @@ async function handleAdminAPI(request, url) {
     const today = new Date().toISOString().split("T")[0];
     const currentMinute = Math.floor(Date.now() / 60000);
 
+    const disabledModelsRes = await kv.get(["config", "disabled_models"]);
+    const disabledModels = disabledModelsRes.value ? JSON.parse(disabledModelsRes.value) : [];
+
     const getStats = async (provider) => {
       const rawKeys = (await kv.get(["config", "keys", provider])).value || "[]";
       const keyPool = JSON.parse(rawKeys);
+
+      const rawDisabledKeys = (await kv.get(["config", "disabled_keys", provider])).value || "[]";
+      const disabledKeys = JSON.parse(rawDisabledKeys);
 
       const keyStats = [];
       for (const fullKey of keyPool) {
@@ -390,7 +432,10 @@ async function handleAdminAPI(request, url) {
         const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
         const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
         const errorCount = parseInt((await kv.get(["errors", provider, tail])).value || "0", 10);
-        const cooldown = (await kv.get(["cooldown", tail])).value ? true : false;
+        
+        // 即時檢查並自動清理過期冷卻
+        const cooldown = await checkAndCleanCooldown(tail);
+        
         const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
         const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
@@ -403,6 +448,7 @@ async function handleAdminAPI(request, url) {
           currentRPM: currentRPM,
           currentTPM: currentTPM,
           inCooldown: cooldown,
+          disabled: disabledKeys.includes(fullKey),
         });
       }
 
@@ -428,6 +474,7 @@ async function handleAdminAPI(request, url) {
       JSON.stringify({
         date: today,
         catalog: MODEL_CATALOG,
+        disabledModels: disabledModels,
         agnes: await getStats("agnes"),
         gemini: await getStats("gemini"),
         logs: logs,
@@ -445,7 +492,34 @@ async function handleAdminAPI(request, url) {
     }
   }
 
-  // 重置冷卻時間
+  if (url.pathname === "/api/admin/toggle-model" && request.method === "POST") {
+    const body = await request.json();
+    const modelId = body.model;
+    const res = await kv.get(["config", "disabled_models"]);
+    let list = res.value ? JSON.parse(res.value) : [];
+    if (list.includes(modelId)) {
+      list = list.filter(m => m !== modelId);
+    } else {
+      list.push(modelId);
+    }
+    await kv.set(["config", "disabled_models"], JSON.stringify(list));
+    return new Response(JSON.stringify({ success: true, disabledModels: list }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  if (url.pathname === "/api/admin/toggle-key" && request.method === "POST") {
+    const body = await request.json();
+    const { provider, key } = body;
+    const res = await kv.get(["config", "disabled_keys", provider]);
+    let list = res.value ? JSON.parse(res.value) : [];
+    if (list.includes(key)) {
+      list = list.filter(k => k !== key);
+    } else {
+      list.push(key);
+    }
+    await kv.set(["config", "disabled_keys", provider], JSON.stringify(list));
+    return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
   if (url.pathname === "/api/admin/reset-cooldown" && request.method === "POST") {
     for await (const entry of kv.list({ prefix: ["cooldown"] })) {
       await kv.delete(entry.key);
@@ -476,9 +550,9 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Agnes 2.5 Active</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Auto-Expiry Cooldown</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash</p>
+        <p class="text-sm text-slate-400 mt-1">冷卻時間 (60秒) 到期自動解除 · 支援模型與 Key 開關控制</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
@@ -486,13 +560,13 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 1: Model Catalog -->
+    <!-- Section 1: Model Catalog with Toggle -->
     <div class="space-y-3">
       <div class="flex justify-between items-center px-1">
         <h2 class="text-lg font-bold text-slate-200 flex items-center gap-2">
           <span>📋</span> 可用模型清單與限額指標
         </h2>
-        <span class="text-xs text-slate-500">Google AI Studio Free Tier Quota Specification</span>
+        <span class="text-xs text-slate-500">點擊按鈕可隨時停用特定模型</span>
       </div>
       <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">載入中...</div>
@@ -507,7 +581,7 @@ function renderAdminHTML() {
           <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
         </div>
         <div class="flex gap-2 items-center">
-          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 解除所有冷卻</button>
+          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 立即清空所有冷卻</button>
           <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
           <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
         </div>
@@ -518,7 +592,7 @@ function renderAdminHTML() {
           <thead class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800/80">
             <tr>
               <th class="py-3 px-2">Key 遮罩</th>
-              <th class="py-3 px-2">即時狀態</th>
+              <th class="py-3 px-2">即時狀態 (60s自動解除)</th>
               <th class="py-3 px-2">即時 RPM</th>
               <th class="py-3 px-2">即時 TPM</th>
               <th class="py-3 px-2">今日 RPD</th>
@@ -551,7 +625,7 @@ function renderAdminHTML() {
 
   <script>
     let activeProvider = 'agnes';
-    let globalData = { catalog: {}, agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} }, logs: [] };
+    let globalData = { catalog: {}, disabledModels: [], agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} }, logs: [] };
 
     function switchTab(prov) {
       activeProvider = prov;
@@ -589,6 +663,7 @@ function renderAdminHTML() {
 
     function renderCatalog() {
       const catalog = globalData.catalog || {};
+      const disabledModels = globalData.disabledModels || [];
       const stats = (globalData[activeProvider] && globalData[activeProvider].modelStats) || {};
       const grid = document.getElementById('modelCatalogGrid');
       grid.innerHTML = '';
@@ -596,9 +671,19 @@ function renderAdminHTML() {
       for (const [id, meta] of Object.entries(catalog)) {
         const mUsage = stats[id] || { today: 0, total: 0, tokensToday: 0 };
         const isVirtual = meta.provider === 'virtual';
+        const isDisabled = disabledModels.includes(id);
 
         const card = document.createElement('div');
-        card.className = \`bg-slate-900/90 p-5 rounded-2xl border \${isVirtual ? 'border-indigo-500/50 bg-gradient-to-br from-slate-900 via-indigo-950/20 to-slate-900' : 'border-slate-800'} flex flex-col justify-between shadow-lg hover:border-slate-700 transition\`;
+        card.className = \`bg-slate-900/90 p-5 rounded-2xl border \${isDisabled ? 'opacity-50 border-rose-900/50 bg-slate-950' : (isVirtual ? 'border-indigo-500/50 bg-gradient-to-br from-slate-900 via-indigo-950/20 to-slate-900' : 'border-slate-800')} flex flex-col justify-between shadow-lg hover:border-slate-700 transition\`;
+
+        let toggleBtnHtml = '';
+        if (!isVirtual) {
+          toggleBtnHtml = \`
+            <button onclick="toggleModel('\${id}')" class="text-xs px-2 py-0.5 rounded-full font-semibold transition \${isDisabled ? 'bg-rose-950 text-rose-400 border border-rose-800 hover:bg-rose-900' : 'bg-emerald-950 text-emerald-400 border border-emerald-800 hover:bg-emerald-900'}">
+              \${isDisabled ? '❌ 已禁用' : '🟢 啟用中'}
+            </button>
+          \`;
+        }
 
         card.innerHTML = \`
           <div>
@@ -610,7 +695,10 @@ function renderAdminHTML() {
                 </div>
                 <div class="font-mono text-xs text-sky-400/90 mt-0.5">\${id}</div>
               </div>
-              <span class="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">\${meta.provider}</span>
+              <div class="flex items-center gap-1.5">
+                \${toggleBtnHtml}
+                <span class="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">\${meta.provider}</span>
+              </div>
             </div>
             <p class="text-xs text-slate-400 mb-4 line-clamp-2">\${meta.desc}</p>
           </div>
@@ -649,8 +737,10 @@ function renderAdminHTML() {
 
       tbody.innerHTML = pData.keys.map((k, idx) => {
         let statusBadge = '<span class="text-emerald-400 text-xs px-2.5 py-1 rounded-full bg-emerald-950/70 border border-emerald-800/80">正常 (Active)</span>';
-        if (k.inCooldown) {
-          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">冷卻中 (Cooldown)</span>';
+        if (k.disabled) {
+          statusBadge = '<span class="text-slate-400 text-xs px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700">已停用 (Disabled)</span>';
+        } else if (k.inCooldown) {
+          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">冷卻中 (60s自動解除)</span>';
         }
 
         const errorBadge = (k.errors > 0) 
@@ -658,7 +748,7 @@ function renderAdminHTML() {
           : \`<span class="text-slate-500 font-mono">0</span>\`;
 
         return \`
-          <tr class="hover:bg-slate-800/30 transition">
+          <tr class="hover:bg-slate-800/30 transition \${k.disabled ? 'opacity-40' : ''}">
             <td class="py-3 px-2 font-mono text-slate-300">\${k.masked}</td>
             <td class="py-3 px-2">\${statusBadge}</td>
             <td class="py-3 px-2 font-mono text-amber-400 font-semibold">\${k.currentRPM || 0} <span class="text-slate-500 text-xs font-normal">RPM</span></td>
@@ -666,7 +756,10 @@ function renderAdminHTML() {
             <td class="py-3 px-2 font-mono text-emerald-400 font-semibold">\${k.today} <span class="text-slate-500 text-xs font-normal">RPD</span></td>
             <td class="py-3 px-2">\${errorBadge}</td>
             <td class="py-3 px-2 font-mono text-slate-400">\${k.total}</td>
-            <td class="py-3 px-2 text-right">
+            <td class="py-3 px-2 text-right space-x-2">
+              <button onclick="toggleKey('\${k.key}')" class="text-xs font-semibold px-2 py-1 rounded transition \${k.disabled ? 'text-emerald-400 hover:bg-emerald-950/40' : 'text-amber-400 hover:bg-amber-950/40'}">
+                \${k.disabled ? '啟用' : '禁用'}
+              </button>
               <button onclick="deleteKey(\${idx})" class="text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition">刪除</button>
             </td>
           </tr>
@@ -696,6 +789,24 @@ function renderAdminHTML() {
           </div>
         \`;
       }).join('');
+    }
+
+    async function toggleModel(modelId) {
+      await fetch('/api/admin/toggle-model', {
+        method: 'POST',
+        headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId })
+      });
+      fetchData();
+    }
+
+    async function toggleKey(key) {
+      await fetch('/api/admin/toggle-key', {
+        method: 'POST',
+        headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: activeProvider, key: key })
+      });
+      fetchData();
     }
 
     async function resetCooldown() {
