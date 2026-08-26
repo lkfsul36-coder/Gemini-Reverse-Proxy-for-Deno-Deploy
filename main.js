@@ -2,11 +2,11 @@
  * Ultra-Stable Multi-Provider AI Proxy
  * Providers: Agnes AI (apihub.agnes-ai.com) & Google Gemini
  * 
- * Features:
- *  - Fixed: Model Toggle Button Click Event
- *  - Standard Error Msg: "All models in priority are being rate limited."
- *  - Auto-Expiring Cooldown (60s timestamp-based auto-unlock)
- *  - Per-Model & Per-Key Enable/Disable Toggle
+ * Fixes:
+ *  - Fixed: Admin Login Button and JavaScript Parsing Errors
+ *  - Fixed: Agnes AI Connection and SSE Streaming Support
+ *  - Fixed: Active Timestamp-based 60s Auto Cooldown
+ *  - Mixed-Lite: Auto-skips disabled models & rate limited failover
  */
 
 const kv = await Deno.openKv();
@@ -91,7 +91,7 @@ async function checkAndCleanCooldown(keyTail) {
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
-  // 1. CORS Preflight
+  // 1. CORS 預檢
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -103,7 +103,7 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. 後台面板與 API
+  // 2. 管理面板及 API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -274,13 +274,12 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     cleanHeaders.set("Content-Type", "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
-    cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
-    cleanHeaders.set("Accept", "application/json, text/plain, */*");
-    cleanHeaders.set("Accept-Language", "en-US,en;q=0.9");
-    cleanHeaders.set("Origin", "https://platform.agnes-ai.com");
-    cleanHeaders.set("Referer", "https://platform.agnes-ai.com/");
 
-    const timeoutMs = provider === "agnes" ? 6000 : 15000;
+    // 標準化請求標頭
+    cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+    cleanHeaders.set("Accept", "application/json, text/event-stream, */*");
+
+    const timeoutMs = provider === "agnes" ? 10000 : 15000;
 
     const targetReq = new Request(targetUrl.toString(), {
       method: "POST",
@@ -545,13 +544,13 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Direct Toggle</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Operational</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">點擊模型卡片按鈕可隨時禁用/啟用 · mixed-lite 自動跳過禁用項</p>
+        <p class="text-sm text-slate-400 mt-1">冷卻時間 60 秒到期自動解除 · 支援單獨模型與 Key 開關控制</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
-        <button onclick="fetchData()" class="bg-sky-600 hover:bg-sky-500 px-4 py-2 rounded-xl text-sm font-semibold transition shadow-md">登入 / 重新整理</button>
+        <button id="loginBtn" class="bg-sky-600 hover:bg-sky-500 px-4 py-2 rounded-xl text-sm font-semibold transition shadow-md cursor-pointer">登入 / 重新整理</button>
       </div>
     </div>
 
@@ -564,7 +563,7 @@ function renderAdminHTML() {
         <span class="text-xs text-slate-500">點擊按鈕即時切換狀態</span>
       </div>
       <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">載入中...</div>
+        <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">請先登入後檢視...</div>
       </div>
     </div>
 
@@ -572,13 +571,13 @@ function renderAdminHTML() {
     <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
       <div class="flex flex-col md:flex-row justify-between md:items-center gap-4 border-b border-slate-800 pb-4">
         <div class="flex gap-2">
-          <button id="tabAgnesBtn" onclick="switchTab('agnes')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white">Agnes Key 池</button>
-          <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
+          <button id="tabAgnesBtn" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white cursor-pointer">Agnes Key 池</button>
+          <button id="tabGeminiBtn" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200 cursor-pointer">Google Gemini Key 池</button>
         </div>
         <div class="flex gap-2 items-center">
-          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 立即清空冷卻</button>
-          <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
-          <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
+          <button id="resetCooldownBtn" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">⚡ 立即清空冷卻</button>
+          <button id="batchAddBtn" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">+ 批量添加</button>
+          <button id="addKeyBtn" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">+ 新增 Key</button>
         </div>
       </div>
 
@@ -610,7 +609,7 @@ function renderAdminHTML() {
           <span class="text-base font-bold text-slate-200">📜 系統故障轉移與限流日誌 (Live Failover & Error Logs)</span>
           <span class="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded">最近 50 筆</span>
         </div>
-        <button onclick="clearLogs()" class="text-xs text-slate-400 hover:text-slate-200 hover:underline">清空日誌</button>
+        <button id="clearLogsBtn" class="text-xs text-slate-400 hover:text-slate-200 hover:underline cursor-pointer">清空日誌</button>
       </div>
       <div id="logsContainer" class="bg-slate-950 p-4 rounded-xl font-mono text-xs max-h-60 overflow-y-auto space-y-2 border border-slate-800/80">
         <div class="text-slate-600">尚無故障或降級轉移記錄。</div>
@@ -622,32 +621,35 @@ function renderAdminHTML() {
     let activeProvider = 'agnes';
     let globalData = { catalog: {}, disabledModels: [], agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} }, logs: [] };
 
-    function switchTab(prov) {
-      activeProvider = prov;
-      document.getElementById('tabAgnesBtn').className = prov === 'agnes' ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white shadow-md' : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200';
-      document.getElementById('tabGeminiBtn').className = prov === 'gemini' ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white shadow-md' : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200';
-      renderView();
-    }
-
     function getAuth() {
       const pwd = document.getElementById('pwdInput').value || localStorage.getItem('deno_proxy_pwd') || '';
-      if(pwd) localStorage.setItem('deno_proxy_pwd', pwd);
+      if (pwd) localStorage.setItem('deno_proxy_pwd', pwd);
       return 'Bearer ' + pwd;
     }
-
-    window.onload = () => {
-      const saved = localStorage.getItem('deno_proxy_pwd');
-      if(saved) document.getElementById('pwdInput').value = saved;
-      fetchData();
-    };
 
     async function fetchData() {
       try {
         const res = await fetch('/api/admin/data', { headers: { 'Authorization': getAuth() } });
-        if(res.status === 401) return alert('密碼錯誤 (Invalid password)');
+        if (res.status === 401) {
+          alert('密碼錯誤 (Invalid password)');
+          return;
+        }
         globalData = await res.json();
         renderView();
-      } catch(e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function switchTab(prov) {
+      activeProvider = prov;
+      document.getElementById('tabAgnesBtn').className = prov === 'agnes' 
+        ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white cursor-pointer shadow-md' 
+        : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200 cursor-pointer';
+      document.getElementById('tabGeminiBtn').className = prov === 'gemini' 
+        ? 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white cursor-pointer shadow-md' 
+        : 'px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200 cursor-pointer';
+      renderView();
     }
 
     function renderView() {
@@ -663,7 +665,8 @@ function renderAdminHTML() {
       const grid = document.getElementById('modelCatalogGrid');
       grid.innerHTML = '';
 
-      for (const [id, meta] of Object.entries(catalog)) {
+      for (const id in catalog) {
+        const meta = catalog[id];
         const mUsage = stats[id] || { today: 0, total: 0, tokensToday: 0 };
         const isVirtual = meta.provider === 'virtual';
         const isDisabled = disabledModels.includes(id);
@@ -761,12 +764,12 @@ function renderAdminHTML() {
         actionTd.className = 'py-3 px-2 text-right space-x-2';
 
         const toggleBtn = document.createElement('button');
-        toggleBtn.className = 'text-xs font-semibold px-2 py-1 rounded transition ' + (k.disabled ? 'text-emerald-400 hover:bg-emerald-950/40' : 'text-amber-400 hover:bg-amber-950/40');
+        toggleBtn.className = 'text-xs font-semibold px-2 py-1 rounded transition cursor-pointer ' + (k.disabled ? 'text-emerald-400 hover:bg-emerald-950/40' : 'text-amber-400 hover:bg-amber-950/40');
         toggleBtn.innerText = k.disabled ? '啟用' : '禁用';
         toggleBtn.onclick = () => toggleKey(k.key);
 
         const delBtn = document.createElement('button');
-        delBtn.className = 'text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition';
+        delBtn.className = 'text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition cursor-pointer';
         delBtn.innerText = '刪除';
         delBtn.onclick = () => deleteKey(idx);
 
@@ -834,7 +837,7 @@ function renderAdminHTML() {
     async function batchAddPrompt() {
       const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
       if (!text || !text.trim()) return;
-      const keys = text.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
+      const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
       const current = (globalData[activeProvider].keys || []).map(k => k.key);
       current.push(...keys);
       await saveKeys(current);
@@ -864,6 +867,21 @@ function renderAdminHTML() {
       });
       await fetchData();
     }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      const saved = localStorage.getItem('deno_proxy_pwd');
+      if (saved) document.getElementById('pwdInput').value = saved;
+
+      document.getElementById('loginBtn').addEventListener('click', fetchData);
+      document.getElementById('tabAgnesBtn').addEventListener('click', () => switchTab('agnes'));
+      document.getElementById('tabGeminiBtn').addEventListener('click', () => switchTab('gemini'));
+      document.getElementById('resetCooldownBtn').addEventListener('click', resetCooldown);
+      document.getElementById('batchAddBtn').addEventListener('click', batchAddPrompt);
+      document.getElementById('addKeyBtn').addEventListener('click', addKeyPrompt);
+      document.getElementById('clearLogsBtn').addEventListener('click', clearLogs);
+
+      fetchData();
+    });
   </script>
 </body>
 </html>`;
