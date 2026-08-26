@@ -1,10 +1,12 @@
 /**
- * Ultra-Stable Multi-Provider AI Proxy with Auto-Expiring Cooldown
+ * Ultra-Stable Multi-Provider AI Proxy
+ * Providers: Agnes AI (apihub.agnes-ai.com) & Google Gemini
+ * 
  * Features:
- *  - Auto-clearing Cooldown (Timestamp-based 60s auto-unlock)
+ *  - Fixed: Model Toggle Button Click Event
+ *  - Standard Error Msg: "All models in priority are being rate limited."
+ *  - Auto-Expiring Cooldown (60s timestamp-based auto-unlock)
  *  - Per-Model & Per-Key Enable/Disable Toggle
- *  - mixed-lite auto-skips disabled models and disabled keys
- *  - Deno KV Persisted Config
  */
 
 const kv = await Deno.openKv();
@@ -14,7 +16,7 @@ const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 
 const AGNES_RPM_LIMIT = 10;
 const AGNES_RPD_LIMIT = 250;
-const COOLDOWN_DURATION_MS = 60000; // 60秒自動解除冷卻
+const COOLDOWN_DURATION_MS = 60000;
 
 const MODEL_CATALOG = {
   "mixed-lite": {
@@ -23,7 +25,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "自動跳過已禁用或冷卻中的模型，於啟用模型中階梯降級備援",
+    desc: "優先依序嘗試已啟用的模型，限流/故障時自動降級備援",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -72,7 +74,6 @@ async function isModelDisabled(modelId) {
   return list.includes(modelId);
 }
 
-// 檢查並自動清理冷卻狀態
 async function checkAndCleanCooldown(keyTail) {
   const cooldownRes = await kv.get(["cooldown", keyTail]);
   if (!cooldownRes.value) return false;
@@ -81,11 +82,10 @@ async function checkAndCleanCooldown(keyTail) {
   const now = Date.now();
 
   if (now >= expireTime) {
-    // 時間已過，自動刪除冷卻
     await kv.delete(["cooldown", keyTail]);
     return false;
   }
-  return true; // 仍在冷卻中
+  return true;
 }
 
 Deno.serve(async (request) => {
@@ -187,13 +187,13 @@ async function executeMixedLiteChain(request, url, requestJson) {
 
   await appendLog({
     type: "exhausted",
-    message: `[mixed-lite] 所有已啟用的備援模型皆已耗盡或無法連線！`,
+    message: `[mixed-lite] All models in priority are being rate limited.`,
   });
 
   return new Response(
     JSON.stringify({
       error: {
-        message: "All active fallback tiers for [mixed-lite] have reached limit or are disabled. Please check /admin.",
+        message: "All models in priority are being rate limited.",
       },
     }),
     { status: 429, headers: { "Content-Type": "application/json" } }
@@ -295,7 +295,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
       if ([400, 401, 403, 404, 429, 500, 502, 503, 504].includes(response.status)) {
         await recordErrorAtomic(provider, currentKey);
-        // 設定精確 60 秒冷卻戳記
         await kv.set(["cooldown", tail], (Date.now() + COOLDOWN_DURATION_MS).toString());
 
         await appendLog({
@@ -335,7 +334,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       });
     } catch (err) {
       await recordErrorAtomic(provider, currentKey);
-      // 網路或超時錯誤，自動冷卻 60 秒
       await kv.set(["cooldown", tail], (Date.now() + COOLDOWN_DURATION_MS).toString());
 
       await appendLog({
@@ -432,10 +430,7 @@ async function handleAdminAPI(request, url) {
         const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
         const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
         const errorCount = parseInt((await kv.get(["errors", provider, tail])).value || "0", 10);
-        
-        // 即時檢查並自動清理過期冷卻
         const cooldown = await checkAndCleanCooldown(tail);
-        
         const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
         const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
@@ -550,9 +545,9 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Auto-Expiry Cooldown</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Direct Toggle</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">冷卻時間 (60秒) 到期自動解除 · 支援模型與 Key 開關控制</p>
+        <p class="text-sm text-slate-400 mt-1">點擊模型卡片按鈕可隨時禁用/啟用 · mixed-lite 自動跳過禁用項</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
@@ -560,13 +555,13 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 1: Model Catalog with Toggle -->
+    <!-- Section 1: Model Catalog -->
     <div class="space-y-3">
       <div class="flex justify-between items-center px-1">
         <h2 class="text-lg font-bold text-slate-200 flex items-center gap-2">
           <span>📋</span> 可用模型清單與限額指標
         </h2>
-        <span class="text-xs text-slate-500">點擊按鈕可隨時停用特定模型</span>
+        <span class="text-xs text-slate-500">點擊按鈕即時切換狀態</span>
       </div>
       <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">載入中...</div>
@@ -581,7 +576,7 @@ function renderAdminHTML() {
           <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
         </div>
         <div class="flex gap-2 items-center">
-          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 立即清空所有冷卻</button>
+          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 立即清空冷卻</button>
           <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
           <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
         </div>
@@ -592,7 +587,7 @@ function renderAdminHTML() {
           <thead class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800/80">
             <tr>
               <th class="py-3 px-2">Key 遮罩</th>
-              <th class="py-3 px-2">即時狀態 (60s自動解除)</th>
+              <th class="py-3 px-2">即時狀態</th>
               <th class="py-3 px-2">即時 RPM</th>
               <th class="py-3 px-2">即時 TPM</th>
               <th class="py-3 px-2">今日 RPD</th>
@@ -674,54 +669,57 @@ function renderAdminHTML() {
         const isDisabled = disabledModels.includes(id);
 
         const card = document.createElement('div');
-        card.className = \`bg-slate-900/90 p-5 rounded-2xl border \${isDisabled ? 'opacity-50 border-rose-900/50 bg-slate-950' : (isVirtual ? 'border-indigo-500/50 bg-gradient-to-br from-slate-900 via-indigo-950/20 to-slate-900' : 'border-slate-800')} flex flex-col justify-between shadow-lg hover:border-slate-700 transition\`;
+        card.className = 'p-5 rounded-2xl border flex flex-col justify-between shadow-lg transition ' + 
+          (isDisabled ? 'opacity-60 border-rose-900/40 bg-slate-950/80' : (isVirtual ? 'border-indigo-500/50 bg-gradient-to-br from-slate-900 via-indigo-950/20 to-slate-900' : 'border-slate-800 bg-slate-900/90 hover:border-slate-700'));
 
-        let toggleBtnHtml = '';
+        const topDiv = document.createElement('div');
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'flex justify-between items-start mb-2';
+
+        const titleDiv = document.createElement('div');
+        titleDiv.innerHTML = '<div class="font-bold text-slate-100 flex items-center gap-2">' +
+          '<span>' + meta.name + '</span>' +
+          (isVirtual ? '<span class="text-[10px] bg-purple-900/80 text-purple-300 px-2 py-0.5 rounded-full border border-purple-700">自動備援</span>' : '') +
+          '</div><div class="font-mono text-xs text-sky-400/90 mt-0.5">' + id + '</div>';
+
+        const actionsDiv = document.createElement('div');
+        actionsDiv.className = 'flex items-center gap-1.5';
+
         if (!isVirtual) {
-          toggleBtnHtml = \`
-            <button onclick="toggleModel('\${id}')" class="text-xs px-2 py-0.5 rounded-full font-semibold transition \${isDisabled ? 'bg-rose-950 text-rose-400 border border-rose-800 hover:bg-rose-900' : 'bg-emerald-950 text-emerald-400 border border-emerald-800 hover:bg-emerald-900'}">
-              \${isDisabled ? '❌ 已禁用' : '🟢 啟用中'}
-            </button>
-          \`;
+          const btn = document.createElement('button');
+          btn.className = 'text-xs px-2.5 py-1 rounded-full font-semibold transition cursor-pointer ' + 
+            (isDisabled ? 'bg-rose-950 text-rose-400 border border-rose-800 hover:bg-rose-900' : 'bg-emerald-950 text-emerald-400 border border-emerald-800 hover:bg-emerald-900');
+          btn.innerText = isDisabled ? '❌ 已禁用' : '🟢 啟用中';
+          btn.onclick = async () => {
+            btn.innerText = '處理中...';
+            await toggleModel(id);
+          };
+          actionsDiv.appendChild(btn);
         }
 
-        card.innerHTML = \`
-          <div>
-            <div class="flex justify-between items-start mb-2">
-              <div>
-                <div class="font-bold text-slate-100 flex items-center gap-2">
-                  <span>\${meta.name}</span>
-                  \${isVirtual ? '<span class="text-[10px] bg-purple-900/80 text-purple-300 px-2 py-0.5 rounded-full border border-purple-700">自動備援</span>' : ''}
-                </div>
-                <div class="font-mono text-xs text-sky-400/90 mt-0.5">\${id}</div>
-              </div>
-              <div class="flex items-center gap-1.5">
-                \${toggleBtnHtml}
-                <span class="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">\${meta.provider}</span>
-              </div>
-            </div>
-            <p class="text-xs text-slate-400 mb-4 line-clamp-2">\${meta.desc}</p>
-          </div>
+        const badge = document.createElement('span');
+        badge.className = 'text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700';
+        badge.innerText = meta.provider;
+        actionsDiv.appendChild(badge);
 
-          <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 space-y-2 text-xs">
-            <div class="flex justify-between items-center">
-              <span class="text-slate-400">1. RPM (分請求上限)</span>
-              <span class="font-mono text-amber-400 font-semibold">\${meta.rpmLimit} req/min</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span class="text-slate-400">2. TPM (分 Token 上限)</span>
-              <span class="font-mono text-cyan-400 font-semibold">\${meta.tpmLimit} tokens</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span class="text-slate-400">3. RPD (日請求上限)</span>
-              <span class="font-mono text-emerald-400 font-semibold">\${meta.rpdLimit} req/day</span>
-            </div>
-            <div class="pt-2 mt-2 border-t border-slate-800/60 flex justify-between text-[11px] text-slate-400">
-              <span>今日累計: <b class="text-slate-200">\${mUsage.today} 次</b></span>
-              <span>歷史總計: <b class="text-slate-200">\${mUsage.total} 次</b></span>
-            </div>
-          </div>
-        \`;
+        headerDiv.appendChild(titleDiv);
+        headerDiv.appendChild(actionsDiv);
+        topDiv.appendChild(headerDiv);
+
+        const descP = document.createElement('p');
+        descP.className = 'text-xs text-slate-400 mb-4 line-clamp-2';
+        descP.innerText = meta.desc;
+        topDiv.appendChild(descP);
+
+        const bottomDiv = document.createElement('div');
+        bottomDiv.className = 'bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 space-y-2 text-xs';
+        bottomDiv.innerHTML = '<div class="flex justify-between items-center"><span class="text-slate-400">1. RPM (分請求上限)</span><span class="font-mono text-amber-400 font-semibold">' + meta.rpmLimit + ' req/min</span></div>' +
+          '<div class="flex justify-between items-center"><span class="text-slate-400">2. TPM (分 Token 上限)</span><span class="font-mono text-cyan-400 font-semibold">' + meta.tpmLimit + ' tokens</span></div>' +
+          '<div class="flex justify-between items-center"><span class="text-slate-400">3. RPD (日請求上限)</span><span class="font-mono text-emerald-400 font-semibold">' + meta.rpdLimit + ' req/day</span></div>' +
+          '<div class="pt-2 mt-2 border-t border-slate-800/60 flex justify-between text-[11px] text-slate-400"><span>今日累計: <b class="text-slate-200">' + mUsage.today + ' 次</b></span><span>歷史總計: <b class="text-slate-200">' + mUsage.total + ' 次</b></span></div>';
+
+        card.appendChild(topDiv);
+        card.appendChild(bottomDiv);
         grid.appendChild(card);
       }
     }
@@ -735,7 +733,8 @@ function renderAdminHTML() {
         return;
       }
 
-      tbody.innerHTML = pData.keys.map((k, idx) => {
+      tbody.innerHTML = '';
+      pData.keys.forEach((k, idx) => {
         let statusBadge = '<span class="text-emerald-400 text-xs px-2.5 py-1 rounded-full bg-emerald-950/70 border border-emerald-800/80">正常 (Active)</span>';
         if (k.disabled) {
           statusBadge = '<span class="text-slate-400 text-xs px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700">已停用 (Disabled)</span>';
@@ -744,27 +743,38 @@ function renderAdminHTML() {
         }
 
         const errorBadge = (k.errors > 0) 
-          ? \`<span class="text-rose-400 font-mono font-bold bg-rose-950/60 border border-rose-800/80 px-2 py-0.5 rounded-lg">\${k.errors}</span>\`
-          : \`<span class="text-slate-500 font-mono">0</span>\`;
+          ? '<span class="text-rose-400 font-mono font-bold bg-rose-950/60 border border-rose-800/80 px-2 py-0.5 rounded-lg">' + k.errors + '</span>'
+          : '<span class="text-slate-500 font-mono">0</span>';
 
-        return \`
-          <tr class="hover:bg-slate-800/30 transition \${k.disabled ? 'opacity-40' : ''}">
-            <td class="py-3 px-2 font-mono text-slate-300">\${k.masked}</td>
-            <td class="py-3 px-2">\${statusBadge}</td>
-            <td class="py-3 px-2 font-mono text-amber-400 font-semibold">\${k.currentRPM || 0} <span class="text-slate-500 text-xs font-normal">RPM</span></td>
-            <td class="py-3 px-2 font-mono text-cyan-400 font-semibold">\${(k.currentTPM || 0).toLocaleString()} <span class="text-slate-500 text-xs font-normal">TPM</span></td>
-            <td class="py-3 px-2 font-mono text-emerald-400 font-semibold">\${k.today} <span class="text-slate-500 text-xs font-normal">RPD</span></td>
-            <td class="py-3 px-2">\${errorBadge}</td>
-            <td class="py-3 px-2 font-mono text-slate-400">\${k.total}</td>
-            <td class="py-3 px-2 text-right space-x-2">
-              <button onclick="toggleKey('\${k.key}')" class="text-xs font-semibold px-2 py-1 rounded transition \${k.disabled ? 'text-emerald-400 hover:bg-emerald-950/40' : 'text-amber-400 hover:bg-amber-950/40'}">
-                \${k.disabled ? '啟用' : '禁用'}
-              </button>
-              <button onclick="deleteKey(\${idx})" class="text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition">刪除</button>
-            </td>
-          </tr>
-        \`;
-      }).join('');
+        const tr = document.createElement('tr');
+        tr.className = 'hover:bg-slate-800/30 transition ' + (k.disabled ? 'opacity-40' : '');
+
+        tr.innerHTML = '<td class="py-3 px-2 font-mono text-slate-300">' + k.masked + '</td>' +
+          '<td class="py-3 px-2">' + statusBadge + '</td>' +
+          '<td class="py-3 px-2 font-mono text-amber-400 font-semibold">' + (k.currentRPM || 0) + ' <span class="text-slate-500 text-xs font-normal">RPM</span></td>' +
+          '<td class="py-3 px-2 font-mono text-cyan-400 font-semibold">' + (k.currentTPM || 0).toLocaleString() + ' <span class="text-slate-500 text-xs font-normal">TPM</span></td>' +
+          '<td class="py-3 px-2 font-mono text-emerald-400 font-semibold">' + k.today + ' <span class="text-slate-500 text-xs font-normal">RPD</span></td>' +
+          '<td class="py-3 px-2">' + errorBadge + '</td>' +
+          '<td class="py-3 px-2 font-mono text-slate-400">' + k.total + '</td>';
+
+        const actionTd = document.createElement('td');
+        actionTd.className = 'py-3 px-2 text-right space-x-2';
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.className = 'text-xs font-semibold px-2 py-1 rounded transition ' + (k.disabled ? 'text-emerald-400 hover:bg-emerald-950/40' : 'text-amber-400 hover:bg-amber-950/40');
+        toggleBtn.innerText = k.disabled ? '啟用' : '禁用';
+        toggleBtn.onclick = () => toggleKey(k.key);
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'text-rose-400 hover:text-rose-300 text-xs font-semibold px-2 py-1 rounded hover:bg-rose-950/40 transition';
+        delBtn.innerText = '刪除';
+        delBtn.onclick = () => deleteKey(idx);
+
+        actionTd.appendChild(toggleBtn);
+        actionTd.appendChild(delBtn);
+        tr.appendChild(actionTd);
+        tbody.appendChild(tr);
+      });
     }
 
     function renderLogs() {
@@ -782,12 +792,7 @@ function renderAdminHTML() {
         if (l.type === 'exhausted') colorClass = 'text-rose-400';
         if (l.type === 'error') colorClass = 'text-rose-300';
 
-        return \`
-          <div class="flex gap-2">
-            <span class="text-slate-500">[\${l.time}]</span>
-            <span class="\${colorClass}">\${l.message}</span>
-          </div>
-        \`;
+        return '<div class="flex gap-2"><span class="text-slate-500">[' + l.time + ']</span><span class="' + colorClass + '">' + l.message + '</span></div>';
       }).join('');
     }
 
@@ -797,7 +802,7 @@ function renderAdminHTML() {
         headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: modelId })
       });
-      fetchData();
+      await fetchData();
     }
 
     async function toggleKey(key) {
@@ -806,7 +811,7 @@ function renderAdminHTML() {
         headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: activeProvider, key: key })
       });
-      fetchData();
+      await fetchData();
     }
 
     async function resetCooldown() {
@@ -815,7 +820,7 @@ function renderAdminHTML() {
         headers: { 'Authorization': getAuth() }
       });
       alert('所有 Key 的冷卻狀態已清除！');
-      fetchData();
+      await fetchData();
     }
 
     async function addKeyPrompt() {
@@ -829,7 +834,7 @@ function renderAdminHTML() {
     async function batchAddPrompt() {
       const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
       if (!text || !text.trim()) return;
-      const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
+      const keys = text.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
       const current = (globalData[activeProvider].keys || []).map(k => k.key);
       current.push(...keys);
       await saveKeys(current);
@@ -848,7 +853,7 @@ function renderAdminHTML() {
         headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: activeProvider, keys: keys })
       });
-      fetchData();
+      await fetchData();
     }
 
     async function clearLogs() {
@@ -857,7 +862,7 @@ function renderAdminHTML() {
         method: 'POST',
         headers: { 'Authorization': getAuth() }
       });
-      fetchData();
+      await fetchData();
     }
   </script>
 </body>
