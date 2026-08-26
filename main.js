@@ -1,8 +1,8 @@
 /**
  * Production Multi-Provider Proxy for Deno Deploy
- * Agnes Host: apihub.agnes-ai.com (Fixed)
+ * Providers: Google Gemini & Agnes AI (apihub.agnes-ai.com)
  * 
- * Exact Failover Chain (4 Tiers Only):
+ * Strict 4-Tier Fallback Chain:
  *  1. agnes-2.5-flash
  *  2. gemini-3.5-flash-lite
  *  3. gemini-3.1-flash-lite
@@ -24,7 +24,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "順序切換：Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash",
+    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.1 Lite -> 3.7 Flash",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -40,7 +40,7 @@ const MODEL_CATALOG = {
     rpmLimit: 30,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "第 2 順位：極速輕量高併發模型",
+    desc: "第 2 順位：次世代超輕量高併發模型",
   },
   "gemini-3.1-flash-lite": {
     name: "Gemini 3.1 Flash-Lite",
@@ -70,6 +70,7 @@ const MIXED_LITE_CHAIN = [
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
+  // 1. CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -81,6 +82,7 @@ Deno.serve(async (request) => {
     });
   }
 
+  // 2. 後台面板與管理 API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -88,10 +90,12 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
+  // 3. /v1/models 列表查詢
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
+  // 4. 解析請求 Body
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -104,10 +108,12 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
+  // 5. 虛擬模型 mixed-lite 階梯調度
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
+  // 6. 原生獨立模型調度
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -138,7 +144,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
       const nextStep = MIXED_LITE_CHAIN[i + 1];
       await appendLog({
         type: "failover",
-        message: `[mixed-lite] Model [${step.model}] 失敗/限流 (${res ? res.status : "無可用Key"}). 自動切換至 [${nextStep.model}].`,
+        message: `[mixed-lite] 模型 [${step.model}] 異常 (${res ? res.status : "無可用Key"}). 自動切換至 [${nextStep.model}].`,
       });
     }
 
@@ -210,19 +216,19 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (usableKeys.length === 0) return null;
 
-  const targetHost = provider === "agnes" ? AGNES_TARGET_HOST : GOOGLE_TARGET_HOST;
+  // 正確路徑對齊
+  let targetHost = AGNES_TARGET_HOST;
   let targetPath = url.pathname;
 
   if (provider === "agnes") {
+    targetHost = AGNES_TARGET_HOST;
     if (!targetPath.startsWith("/v1/")) {
-      targetPath = "/v1" + targetPath;
+      targetPath = "/v1" + (targetPath.startsWith("/") ? targetPath : "/" + targetPath);
     }
   } else if (provider === "gemini") {
-    if (targetPath.startsWith("/v1/")) {
-      targetPath = "/v1beta/openai" + targetPath;
-    } else {
-      targetPath = "/v1beta/openai/v1" + targetPath;
-    }
+    targetHost = GOOGLE_TARGET_HOST;
+    // 標準 OpenAI 相容端點：/v1beta/openai/chat/completions
+    targetPath = "/v1beta/openai/chat/completions";
   }
 
   for (let i = 0; i < usableKeys.length; i++) {
@@ -249,13 +255,13 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     try {
       const response = await fetch(targetReq);
 
-      if ([401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
+      if ([400, 401, 403, 404, 429, 500, 502, 503, 504].includes(response.status)) {
         await recordErrorAtomic(provider, currentKey);
         await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
 
         await appendLog({
           type: "error",
-          message: `Key [...${tail}] 請求 [${targetModel}] 回應 HTTP ${response.status}。進入 60 秒冷卻。`,
+          message: `Key [...${tail}] 在 [${targetModel}] 觸發 HTTP ${response.status}。進入 60 秒冷卻。`,
         });
 
         if (i < usableKeys.length - 1) continue;
