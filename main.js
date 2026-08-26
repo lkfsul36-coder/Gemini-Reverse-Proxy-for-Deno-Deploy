@@ -1,15 +1,17 @@
 /**
  * Production Multi-Provider Proxy for Deno Deploy
- * Features:
- *  - Real-time Fallback & Error Event Logs (rendered at the bottom of /admin)
- *  - Virtual Auto-Failover: agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash
- *  - Google AI Studio 4-Metric Quota Dashboard (RPM / TPM / RPD / Errors)
- *  - Strict Client Header Isolation & SSE Stream Stability
+ * Agnes Host: apihub.agnes-ai.com (Fixed)
+ * 
+ * Exact Failover Chain (4 Tiers Only):
+ *  1. agnes-2.5-flash
+ *  2. gemini-3.5-flash-lite
+ *  3. gemini-3.1-flash-lite
+ *  4. gemini-3.7-flash
  */
 
 const kv = await Deno.openKv();
 const GOOGLE_TARGET_HOST = "generativelanguage.googleapis.com";
-const DEFAULT_AGNES_HOST = Deno.env.get("AGNES_HOST") || "api.agnes.ai";
+const AGNES_TARGET_HOST = "apihub.agnes-ai.com";
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 
 const AGNES_RPM_LIMIT = 10;
@@ -22,7 +24,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0",
+    desc: "順序切換：Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -30,7 +32,7 @@ const MODEL_CATALOG = {
     rpmLimit: 10,
     tpmLimit: "250,000",
     rpdLimit: 250,
-    desc: "Agnes 多模態旗艦模型 (10 RPM / 250 RPD)",
+    desc: "第 1 順位：Agnes 旗艦多模態模型 (10 RPM / 250 RPD)",
   },
   "gemini-3.5-flash-lite": {
     name: "Gemini 3.5 Flash-Lite",
@@ -38,40 +40,31 @@ const MODEL_CATALOG = {
     rpmLimit: 30,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "極速響應輕量模型",
+    desc: "第 2 順位：極速輕量高併發模型",
   },
-  "gemini-3.0-flash": {
-    name: "Gemini 3.0 Flash",
+  "gemini-3.1-flash-lite": {
+    name: "Gemini 3.1 Flash-Lite",
+    provider: "gemini",
+    rpmLimit: 30,
+    tpmLimit: "1,000,000",
+    rpdLimit: 1500,
+    desc: "第 3 順位：高穩定輕量推理模型",
+  },
+  "gemini-3.7-flash": {
+    name: "Gemini 3.7 Flash",
     provider: "gemini",
     rpmLimit: 15,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "平衡推理標準模型",
-  },
-  "gemini-2.5-flash": {
-    name: "Gemini 2.5 Flash",
-    provider: "gemini",
-    rpmLimit: 15,
-    tpmLimit: "1,000,000",
-    rpdLimit: 1500,
-    desc: "長上下文代碼主力模型",
-  },
-  "gemini-2.0-flash": {
-    name: "Gemini 2.0 Flash",
-    provider: "gemini",
-    rpmLimit: 15,
-    tpmLimit: "1,000,000",
-    rpdLimit: 1500,
-    desc: "高吞吐備援模型",
+    desc: "第 4 順位：終極高智商 Flash 旗艦模型",
   },
 };
 
 const MIXED_LITE_CHAIN = [
   { provider: "agnes", model: "agnes-2.5-flash" },
   { provider: "gemini", model: "gemini-3.5-flash-lite" },
-  { provider: "gemini", model: "gemini-3.0-flash" },
-  { provider: "gemini", model: "gemini-2.5-flash" },
-  { provider: "gemini", model: "gemini-2.0-flash" },
+  { provider: "gemini", model: "gemini-3.1-flash-lite" },
+  { provider: "gemini", model: "gemini-3.7-flash" },
 ];
 
 Deno.serve(async (request) => {
@@ -145,7 +138,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
       const nextStep = MIXED_LITE_CHAIN[i + 1];
       await appendLog({
         type: "failover",
-        message: `[mixed-lite] Model [${step.model}] exhausted/failed (${res ? res.status : "No usable keys"}). Auto-switching to [${nextStep.model}].`,
+        message: `[mixed-lite] Model [${step.model}] 失敗/限流 (${res ? res.status : "無可用Key"}). 自動切換至 [${nextStep.model}].`,
       });
     }
 
@@ -156,7 +149,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
 
   await appendLog({
     type: "exhausted",
-    message: `[mixed-lite] All 5 fallback model tiers exhausted!`,
+    message: `[mixed-lite] 全部 4 級模型皆已耗盡或無法連線！`,
   });
 
   return new Response(
@@ -175,7 +168,7 @@ async function executeSingleModel(request, url, bodyBuffer, targetModel, provide
 
   await appendLog({
     type: "exhausted",
-    message: `Model [${targetModel}] reached rate-limit or all keys in cooldown.`,
+    message: `模型 [${targetModel}] 達到限額或所有 Key 冷卻中。`,
   });
 
   return new Response(
@@ -217,7 +210,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (usableKeys.length === 0) return null;
 
-  const targetHost = provider === "agnes" ? DEFAULT_AGNES_HOST : GOOGLE_TARGET_HOST;
+  const targetHost = provider === "agnes" ? AGNES_TARGET_HOST : GOOGLE_TARGET_HOST;
   let targetPath = url.pathname;
 
   if (provider === "agnes") {
@@ -250,6 +243,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       headers: cleanHeaders,
       body: bodyBuffer ? bodyBuffer.slice(0) : null,
       redirect: "follow",
+      signal: AbortSignal.timeout(8000),
     });
 
     try {
@@ -261,7 +255,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
         await appendLog({
           type: "error",
-          message: `Key [...${tail}] on [${targetModel}] triggered HTTP ${response.status}. Entering 60s cooldown.`,
+          message: `Key [...${tail}] 請求 [${targetModel}] 回應 HTTP ${response.status}。進入 60 秒冷卻。`,
         });
 
         if (i < usableKeys.length - 1) continue;
@@ -298,7 +292,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       await recordErrorAtomic(provider, currentKey);
       await appendLog({
         type: "error",
-        message: `Network error on [...${tail}] (${targetModel}): ${err.message}`,
+        message: `連線至 ${targetHost} 失敗 (...${tail} - ${targetModel}): ${err.message}`,
       });
       if (i < usableKeys.length - 1) continue;
     }
@@ -458,14 +452,13 @@ function renderAdminHTML() {
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans antialiased">
   <div class="max-w-6xl mx-auto space-y-6">
-    <!-- Header -->
     <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-900/90 p-6 rounded-2xl border border-slate-800 gap-4 shadow-xl backdrop-blur-sm">
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Auto-Failover Active</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">4-Tier Fallback</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">RPM · TPM · RPD · Errors · Real-time Failover Event Logging</p>
+        <p class="text-sm text-slate-400 mt-1">Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
@@ -481,7 +474,6 @@ function renderAdminHTML() {
         </h2>
         <span class="text-xs text-slate-500">Google AI Studio Free Tier Quota Specification</span>
       </div>
-
       <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <div class="col-span-full py-8 text-center text-slate-500 bg-slate-900/50 rounded-2xl border border-slate-800">載入中...</div>
       </div>
@@ -494,7 +486,7 @@ function renderAdminHTML() {
           <button id="tabAgnesBtn" onclick="switchTab('agnes')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white">Agnes Key 池</button>
           <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
         </div>
-        <div class="flex gap-2">
+        <div class="flex gap-2 items-center">
           <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
           <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
         </div>
@@ -521,7 +513,7 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 3: Live Failover & Error Logs at Bottom -->
+    <!-- Section 3: Live Failover & Error Logs -->
     <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
       <div class="flex justify-between items-center border-b border-slate-800 pb-3">
         <div class="flex items-center gap-2">
