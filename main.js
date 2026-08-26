@@ -1,12 +1,12 @@
 /**
  * Ultra-Stable Multi-Provider AI Proxy
- * Providers: Agnes AI (apihub.agnes-ai.com) & Google Gemini
+ * Providers: Agnes AI (https://apihub.agnes-ai.com/v1) & Google Gemini
  * 
- * Fixes:
- *  - Fixed: Admin Login Button and JavaScript Parsing Errors
- *  - Fixed: Agnes AI Connection and SSE Streaming Support
- *  - Fixed: Active Timestamp-based 60s Auto Cooldown
- *  - Mixed-Lite: Auto-skips disabled models & rate limited failover
+ * Strict 4-Tier Fallback Chain:
+ *  1. agnes-2.0-flash
+ *  2. gemini-3.5-flash-lite
+ *  3. gemini-3.1-flash-lite
+ *  4. gemini-3.7-flash
  */
 
 const kv = await Deno.openKv();
@@ -25,15 +25,15 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "優先依序嘗試已啟用的模型，限流/故障時自動降級備援",
+    desc: "優先使用 Agnes 2.0 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.1 Lite -> 3.7 Flash",
   },
-  "agnes-2.5-flash": {
-    name: "Agnes 2.5 Flash",
+  "agnes-2.0-flash": {
+    name: "Agnes 2.0 Flash",
     provider: "agnes",
     rpmLimit: 10,
     tpmLimit: "250,000",
     rpdLimit: 250,
-    desc: "第 1 順位：Agnes 旗艦多模態模型 (10 RPM / 250 RPD)",
+    desc: "第 1 順位：Agnes 官方多模態模型",
   },
   "gemini-3.5-flash-lite": {
     name: "Gemini 3.5 Flash-Lite",
@@ -62,7 +62,7 @@ const MODEL_CATALOG = {
 };
 
 const MIXED_LITE_CHAIN = [
-  { provider: "agnes", model: "agnes-2.5-flash" },
+  { provider: "agnes", model: "agnes-2.0-flash" },
   { provider: "gemini", model: "gemini-3.5-flash-lite" },
   { provider: "gemini", model: "gemini-3.1-flash-lite" },
   { provider: "gemini", model: "gemini-3.7-flash" },
@@ -74,7 +74,7 @@ async function isModelDisabled(modelId) {
   return list.includes(modelId);
 }
 
-async function checkAndCleanCooldown(keyTail) {
+async function isKeyInCooldown(keyTail) {
   const cooldownRes = await kv.get(["cooldown", keyTail]);
   if (!cooldownRes.value) return false;
 
@@ -91,7 +91,6 @@ async function checkAndCleanCooldown(keyTail) {
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
-  // 1. CORS 預檢
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -103,7 +102,6 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. 管理面板及 API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -111,12 +109,10 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
-  // 3. /v1/models 列表查詢
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
-  // 4. 解析請求 Body
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -136,12 +132,10 @@ Deno.serve(async (request) => {
     );
   }
 
-  // 5. 虛擬模型 mixed-lite 階梯調度
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
-  // 6. 原生獨立模型調度
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -238,8 +232,8 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     if (disabledKeys.includes(k)) continue;
 
     const tail = k.slice(-8);
-    const isInCooldown = await checkAndCleanCooldown(tail);
-    if (isInCooldown) continue;
+    const inCooldown = await isKeyInCooldown(tail);
+    if (inCooldown) continue;
 
     if (provider === "agnes") {
       const rpdCount = parseInt((await kv.get(["usage", "agnes", "key", tail, "today", today])).value || "0", 10);
@@ -256,9 +250,14 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
   let targetHost = AGNES_TARGET_HOST;
   let targetPath = url.pathname;
 
+  // 正確對齊 Base URL 路徑
   if (provider === "agnes") {
     targetHost = AGNES_TARGET_HOST;
-    targetPath = "/v1/chat/completions";
+    let cleanPath = url.pathname;
+    if (cleanPath.startsWith("/v1")) cleanPath = cleanPath.slice(3);
+    if (!cleanPath.startsWith("/")) cleanPath = "/" + cleanPath;
+    if (cleanPath === "/" || cleanPath === "") cleanPath = "/chat/completions";
+    targetPath = "/v1" + cleanPath;
   } else if (provider === "gemini") {
     targetHost = GOOGLE_TARGET_HOST;
     targetPath = "/v1beta/openai/chat/completions";
@@ -274,8 +273,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     cleanHeaders.set("Content-Type", "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
-
-    // 標準化請求標頭
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
     cleanHeaders.set("Accept", "application/json, text/event-stream, */*");
 
@@ -298,7 +295,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
         await appendLog({
           type: "error",
-          message: `Key [...${tail}] 在 [${targetModel}] 觸發 HTTP ${response.status}。進入 60 秒自動冷卻。`,
+          message: `Key [...${tail}] 在 [${targetModel}] 觸發 HTTP ${response.status}。進入 60 秒冷卻。`,
         });
 
         if (i < usableKeys.length - 1) continue;
@@ -429,7 +426,7 @@ async function handleAdminAPI(request, url) {
         const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
         const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
         const errorCount = parseInt((await kv.get(["errors", provider, tail])).value || "0", 10);
-        const cooldown = await checkAndCleanCooldown(tail);
+        const cooldown = await isKeyInCooldown(tail);
         const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
         const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
@@ -837,7 +834,7 @@ function renderAdminHTML() {
     async function batchAddPrompt() {
       const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
       if (!text || !text.trim()) return;
-      const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
+      const keys = text.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
       const current = (globalData[activeProvider].keys || []).map(k => k.key);
       current.push(...keys);
       await saveKeys(current);
