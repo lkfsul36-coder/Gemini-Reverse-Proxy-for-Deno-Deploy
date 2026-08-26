@@ -237,15 +237,23 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     cleanHeaders.set("Content-Type", "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
-    cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-    cleanHeaders.set("Accept", "application/json");
+    
+    // 嚴格偽裝標準桌面端請求，防止被 WAF 直接阻擋/丟包
+    cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
+    cleanHeaders.set("Accept", "application/json, text/plain, */*");
+    cleanHeaders.set("Accept-Language", "en-US,en;q=0.9");
+    cleanHeaders.set("Origin", "https://platform.agnes-ai.com");
+    cleanHeaders.set("Referer", "https://platform.agnes-ai.com/");
+
+    // Agnes 設定 8 秒超時，Gemini 設定 15 秒超時
+    const timeoutMs = provider === "agnes" ? 8000 : 15000;
 
     const targetReq = new Request(targetUrl.toString(), {
       method: "POST",
       headers: cleanHeaders,
       body: bodyBuffer ? bodyBuffer.slice(0) : null,
       redirect: "follow",
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     try {
@@ -437,6 +445,14 @@ async function handleAdminAPI(request, url) {
     }
   }
 
+  // 重置冷卻時間
+  if (url.pathname === "/api/admin/reset-cooldown" && request.method === "POST") {
+    for await (const entry of kv.list({ prefix: ["cooldown"] })) {
+      await kv.delete(entry.key);
+    }
+    return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
   if (url.pathname === "/api/admin/clear-logs" && request.method === "POST") {
     await kv.set(["system", "logs"], JSON.stringify([]));
     return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -491,6 +507,7 @@ function renderAdminHTML() {
           <button id="tabGeminiBtn" onclick="switchTab('gemini')" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200">Google Gemini Key 池</button>
         </div>
         <div class="flex gap-2 items-center">
+          <button onclick="resetCooldown()" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">⚡ 解除所有冷卻</button>
           <button onclick="batchAddPrompt()" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 批量添加</button>
           <button onclick="addKeyPrompt()" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition">+ 新增 Key</button>
         </div>
@@ -679,6 +696,15 @@ function renderAdminHTML() {
           </div>
         \`;
       }).join('');
+    }
+
+    async function resetCooldown() {
+      await fetch('/api/admin/reset-cooldown', {
+        method: 'POST',
+        headers: { 'Authorization': getAuth() }
+      });
+      alert('所有 Key 的冷卻狀態已清除！');
+      fetchData();
     }
 
     async function addKeyPrompt() {
