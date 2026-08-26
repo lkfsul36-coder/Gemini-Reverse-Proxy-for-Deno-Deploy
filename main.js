@@ -1,12 +1,10 @@
 /**
  * Production Multi-Provider Proxy for Deno Deploy
- * Providers: Google Gemini & Agnes AI
- * 
  * Features:
- *  - Fixed: Agnes 2.5 Flash is strictly prioritized in mixed-lite
- *  - Fixed: Client header sanitization (no key leak/pollution)
- *  - Virtual Fallback: agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash
- *  - Error Count tracking & Google AI Studio Style 4-Metric Live Dashboard
+ *  - Real-time Fallback & Error Event Logs (rendered at the bottom of /admin)
+ *  - Virtual Auto-Failover: agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash
+ *  - Google AI Studio 4-Metric Quota Dashboard (RPM / TPM / RPD / Errors)
+ *  - Strict Client Header Isolation & SSE Stream Stability
  */
 
 const kv = await Deno.openKv();
@@ -79,7 +77,6 @@ const MIXED_LITE_CHAIN = [
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
-  // 1. CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -91,7 +88,6 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. Dashboard & Admin APIs
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -99,12 +95,10 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
-  // 3. /v1/models listing
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
-  // 4. Parse Request Body
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -117,12 +111,10 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
-  // 5. Virtual Model Handler (mixed-lite)
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
-  // 6. Single Native Model Handler
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -131,7 +123,8 @@ Deno.serve(async (request) => {
 async function executeMixedLiteChain(request, url, requestJson) {
   let lastResponse = null;
 
-  for (const step of MIXED_LITE_CHAIN) {
+  for (let i = 0; i < MIXED_LITE_CHAIN.length; i++) {
+    const step = MIXED_LITE_CHAIN[i];
     let activeBuffer = null;
     if (requestJson) {
       const cloned = JSON.parse(JSON.stringify(requestJson));
@@ -147,10 +140,24 @@ async function executeMixedLiteChain(request, url, requestJson) {
       resHeaders.set("X-Provider-Used", step.provider);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers: resHeaders });
     }
+
+    if (i < MIXED_LITE_CHAIN.length - 1) {
+      const nextStep = MIXED_LITE_CHAIN[i + 1];
+      await appendLog({
+        type: "failover",
+        message: `[mixed-lite] Model [${step.model}] exhausted/failed (${res ? res.status : "No usable keys"}). Auto-switching to [${nextStep.model}].`,
+      });
+    }
+
     if (res) lastResponse = res;
   }
 
   if (lastResponse) return lastResponse;
+
+  await appendLog({
+    type: "exhausted",
+    message: `[mixed-lite] All 5 fallback model tiers exhausted!`,
+  });
 
   return new Response(
     JSON.stringify({
@@ -166,6 +173,11 @@ async function executeSingleModel(request, url, bodyBuffer, targetModel, provide
   const res = await attemptForward(request, url, bodyBuffer, targetModel, provider, false);
   if (res) return res;
 
+  await appendLog({
+    type: "exhausted",
+    message: `Model [${targetModel}] reached rate-limit or all keys in cooldown.`,
+  });
+
   return new Response(
     JSON.stringify({
       error: {
@@ -180,16 +192,14 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
   const today = new Date().toISOString().split("T")[0];
   const currentMinute = Math.floor(Date.now() / 60000);
 
-  // 僅讀取該 Provider 專屬配置的 Key 池
   const keysEntry = await kv.get(["config", "keys", provider]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
 
   if (keyPool.length === 0) return null;
 
-  // 隨機打散負載均衡
   const candidateKeys = [...keyPool].sort(() => Math.random() - 0.5);
-
   const usableKeys = [];
+
   for (const k of candidateKeys) {
     const tail = k.slice(-8);
     const cooldown = await kv.get(["cooldown", tail]);
@@ -207,7 +217,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (usableKeys.length === 0) return null;
 
-  // 目標路徑與主機標準化
   const targetHost = provider === "agnes" ? DEFAULT_AGNES_HOST : GOOGLE_TARGET_HOST;
   let targetPath = url.pathname;
 
@@ -249,6 +258,12 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       if ([401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
         await recordErrorAtomic(provider, currentKey);
         await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
+
+        await appendLog({
+          type: "error",
+          message: `Key [...${tail}] on [${targetModel}] triggered HTTP ${response.status}. Entering 60s cooldown.`,
+        });
+
         if (i < usableKeys.length - 1) continue;
         if (isFallbackMode) return null;
       }
@@ -279,8 +294,12 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
         statusText: response.statusText,
         headers: resHeaders,
       });
-    } catch (_err) {
+    } catch (err) {
       await recordErrorAtomic(provider, currentKey);
+      await appendLog({
+        type: "error",
+        message: `Network error on [...${tail}] (${targetModel}): ${err.message}`,
+      });
       if (i < usableKeys.length - 1) continue;
     }
   }
@@ -319,9 +338,6 @@ async function recordUsageAtomic(provider, key, model, tokens) {
     .set(mTotal, (parseInt(resMAll.value || "0", 10) + 1).toString())
     .set(mTokensToday, (parseInt(resToken.value || "0", 10) + tokens).toString())
     .commit();
-
-  await appendIndex(["index", provider, "keys"], keyTail);
-  await appendIndex(["index", provider, "models"], model);
 }
 
 async function recordErrorAtomic(provider, key) {
@@ -332,13 +348,17 @@ async function recordErrorAtomic(provider, key) {
   await kv.set(errKey, count.toString());
 }
 
-async function appendIndex(keyPath, item) {
-  const res = await kv.get(keyPath);
-  let list = res.value ? JSON.parse(res.value) : [];
-  if (!list.includes(item)) {
-    list.push(item);
-    await kv.set(keyPath, JSON.stringify(list));
-  }
+async function appendLog(event) {
+  const logEntry = {
+    time: new Date().toLocaleTimeString(),
+    type: event.type,
+    message: event.message,
+  };
+  const res = await kv.get(["system", "logs"]);
+  let logs = res.value ? JSON.parse(res.value) : [];
+  logs.unshift(logEntry);
+  if (logs.length > 50) logs = logs.slice(0, 50);
+  await kv.set(["system", "logs"], JSON.stringify(logs));
 }
 
 async function handleAdminAPI(request, url) {
@@ -395,12 +415,16 @@ async function handleAdminAPI(request, url) {
       return { keys: keyStats, modelStats: modelStats };
     };
 
+    const logsRes = await kv.get(["system", "logs"]);
+    const logs = logsRes.value ? JSON.parse(logsRes.value) : [];
+
     return new Response(
       JSON.stringify({
         date: today,
         catalog: MODEL_CATALOG,
         agnes: await getStats("agnes"),
         gemini: await getStats("gemini"),
+        logs: logs,
       }),
       { headers: { "Content-Type": "application/json" } }
     );
@@ -415,6 +439,11 @@ async function handleAdminAPI(request, url) {
     }
   }
 
+  if (url.pathname === "/api/admin/clear-logs" && request.method === "POST") {
+    await kv.set(["system", "logs"], JSON.stringify([]));
+    return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
   return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
 }
 
@@ -423,19 +452,20 @@ function renderAdminHTML() {
 <html lang="zh-HK">
 <head>
   <meta charset="UTF-8">
-  <title>AI Studio Style Rate-Limit Dashboard</title>
+  <title>AI Studio Style Rate-Limit & Event Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans antialiased">
   <div class="max-w-6xl mx-auto space-y-6">
+    <!-- Header -->
     <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-900/90 p-6 rounded-2xl border border-slate-800 gap-4 shadow-xl backdrop-blur-sm">
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Agnes First</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Auto-Failover Active</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">RPM (分請求) · TPM (分 Token) · RPD (日請求) · Errors (錯誤統計)</p>
+        <p class="text-sm text-slate-400 mt-1">RPM · TPM · RPD · Errors · Real-time Failover Event Logging</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
@@ -457,7 +487,7 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 2: Key Pool Table with Error Tracking -->
+    <!-- Section 2: Key Pool Table -->
     <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
       <div class="flex flex-col md:flex-row justify-between md:items-center gap-4 border-b border-slate-800 pb-4">
         <div class="flex gap-2">
@@ -479,7 +509,7 @@ function renderAdminHTML() {
               <th class="py-3 px-2">即時 RPM</th>
               <th class="py-3 px-2">即時 TPM</th>
               <th class="py-3 px-2">今日 RPD</th>
-              <th class="py-3 px-2">累計錯誤 (Errors)</th>
+              <th class="py-3 px-2">累計錯誤</th>
               <th class="py-3 px-2">歷史成功總計</th>
               <th class="py-3 px-2 text-right">操作</th>
             </tr>
@@ -490,11 +520,25 @@ function renderAdminHTML() {
         </table>
       </div>
     </div>
+
+    <!-- Section 3: Live Failover & Error Logs at Bottom -->
+    <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
+      <div class="flex justify-between items-center border-b border-slate-800 pb-3">
+        <div class="flex items-center gap-2">
+          <span class="text-base font-bold text-slate-200">📜 系統故障轉移與限流日誌 (Live Failover & Error Logs)</span>
+          <span class="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded">最近 50 筆</span>
+        </div>
+        <button onclick="clearLogs()" class="text-xs text-slate-400 hover:text-slate-200 hover:underline">清空日誌</button>
+      </div>
+      <div id="logsContainer" class="bg-slate-950 p-4 rounded-xl font-mono text-xs max-h-60 overflow-y-auto space-y-2 border border-slate-800/80">
+        <div class="text-slate-600">尚無故障或降級轉移記錄。</div>
+      </div>
+    </div>
   </div>
 
   <script>
     let activeProvider = 'agnes';
-    let globalData = { catalog: {}, agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} } };
+    let globalData = { catalog: {}, agnes: { keys: [], modelStats: {} }, gemini: { keys: [], modelStats: {} }, logs: [] };
 
     function switchTab(prov) {
       activeProvider = prov;
@@ -527,6 +571,7 @@ function renderAdminHTML() {
     function renderView() {
       renderCatalog();
       renderKeyPool();
+      renderLogs();
     }
 
     function renderCatalog() {
@@ -616,6 +661,30 @@ function renderAdminHTML() {
       }).join('');
     }
 
+    function renderLogs() {
+      const logs = globalData.logs || [];
+      const container = document.getElementById('logsContainer');
+
+      if (logs.length === 0) {
+        container.innerHTML = '<div class="text-slate-600">尚無故障或降級轉移記錄。</div>';
+        return;
+      }
+
+      container.innerHTML = logs.map(l => {
+        let colorClass = 'text-slate-300';
+        if (l.type === 'failover') colorClass = 'text-amber-400';
+        if (l.type === 'exhausted') colorClass = 'text-rose-400';
+        if (l.type === 'error') colorClass = 'text-rose-300';
+
+        return \`
+          <div class="flex gap-2">
+            <span class="text-slate-500">[\${l.time}]</span>
+            <span class="\${colorClass}">\${l.message}</span>
+          </div>
+        \`;
+      }).join('');
+    }
+
     async function addKeyPrompt() {
       const key = prompt('輸入新的 API Key (' + activeProvider.toUpperCase() + '):');
       if (!key || !key.trim()) return;
@@ -645,6 +714,15 @@ function renderAdminHTML() {
         method: 'POST',
         headers: { 'Authorization': getAuth(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: activeProvider, keys: keys })
+      });
+      fetchData();
+    }
+
+    async function clearLogs() {
+      if (!confirm('確定要清空日誌嗎？')) return;
+      await fetch('/api/admin/clear-logs', {
+        method: 'POST',
+        headers: { 'Authorization': getAuth() }
       });
       fetchData();
     }
