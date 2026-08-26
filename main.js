@@ -1,7 +1,12 @@
 /**
- * Production Multi-Provider Proxy for Deno Deploy
- * Agnes Host: apihub.agnes-ai.com
- * Priority: Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash
+ * Ultra-Stable Multi-Provider AI Proxy
+ * Providers: Agnes AI (apihub.agnes-ai.com) & Google Gemini
+ * 
+ * Strict 4-Tier Fallback Chain:
+ *  1. agnes-2.5-flash
+ *  2. gemini-3.5-flash-lite
+ *  3. gemini-3.1-flash-lite
+ *  4. gemini-3.7-flash
  */
 
 const kv = await Deno.openKv();
@@ -19,7 +24,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash",
+    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.1 Lite -> 3.7 Flash",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -65,6 +70,7 @@ const MIXED_LITE_CHAIN = [
 Deno.serve(async (request) => {
   const url = new URL(request.url);
 
+  // 1. CORS Preflight
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: {
@@ -76,6 +82,7 @@ Deno.serve(async (request) => {
     });
   }
 
+  // 2. 後台面板與 API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -83,10 +90,12 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
+  // 3. /v1/models 列表查詢
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
+  // 4. 解析請求 Body
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -99,10 +108,12 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
+  // 5. 虛擬模型 mixed-lite 階梯調度
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
+  // 6. 原生獨立模型調度
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -133,7 +144,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
       const nextStep = MIXED_LITE_CHAIN[i + 1];
       await appendLog({
         type: "failover",
-        message: `[mixed-lite] 模型 [${step.model}] 異常 (${res ? res.status : "無可用Key/超時"}). 自動切換至 [${nextStep.model}].`,
+        message: `[mixed-lite] 模型 [${step.model}] 失敗/限流 (${res ? res.status : "冷卻中/超時"}). 自動切換至 [${nextStep.model}].`,
       });
     }
 
@@ -210,9 +221,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (provider === "agnes") {
     targetHost = AGNES_TARGET_HOST;
-    if (!targetPath.startsWith("/v1/")) {
-      targetPath = "/v1" + (targetPath.startsWith("/") ? targetPath : "/" + targetPath);
-    }
+    targetPath = "/v1/chat/completions";
   } else if (provider === "gemini") {
     targetHost = GOOGLE_TARGET_HOST;
     targetPath = "/v1beta/openai/chat/completions";
@@ -225,21 +234,18 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     if (provider !== "agnes") targetUrl.searchParams.set("key", currentKey);
 
     const cleanHeaders = new Headers();
-    cleanHeaders.set("Content-Type", request.headers.get("content-type") || "application/json");
+    cleanHeaders.set("Content-Type", "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-    cleanHeaders.set("Accept-Encoding", "identity");
-
-    // 針對 Agnes 採用 3.5 秒快速超時，Gemini 採用 10 秒超時
-    const timeoutMs = provider === "agnes" ? 3500 : 10000;
+    cleanHeaders.set("Accept", "application/json");
 
     const targetReq = new Request(targetUrl.toString(), {
-      method: request.method,
+      method: "POST",
       headers: cleanHeaders,
       body: bodyBuffer ? bodyBuffer.slice(0) : null,
       redirect: "follow",
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(12000),
     });
 
     try {
@@ -286,8 +292,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       });
     } catch (err) {
       await recordErrorAtomic(provider, currentKey);
-      // 連線超時或網路失敗，冷卻 120 秒避免反覆拖慢請求
-      await kv.set(["cooldown", tail], "1", { expireIn: 120000 });
+      await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
 
       await appendLog({
         type: "error",
@@ -455,7 +460,7 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Fast-Failover Active</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Agnes 2.5 Active</span>
         </div>
         <p class="text-sm text-slate-400 mt-1">Agnes 2.5 Flash -> Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Gemini 3.7 Flash</p>
       </div>
