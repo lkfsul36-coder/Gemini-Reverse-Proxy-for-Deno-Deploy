@@ -1,9 +1,8 @@
 /**
  * Gemini Reverse Proxy for Deno Deploy
- * Supports OpenAI format conversion, Key rotation, Native Deno KV persistence, and English Admin Dashboard.
+ * Fully stripped client headers to bypass geo-restrictions natively.
  */
 
-// Initialize Deno Native Global KV Database
 const kv = await Deno.openKv();
 const TARGET_HOST = "generativelanguage.googleapis.com";
 
@@ -22,7 +21,7 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. Admin Dashboard & Management APIs
+  // 2. Admin Dashboard & API
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -30,7 +29,7 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
-  // 3. Model & Route Identification
+  // 3. Route & Model Identification
   const isOpenAIFormat = url.pathname.startsWith("/v1/");
   let targetModel = "gemini-3.5-flash-lite";
 
@@ -45,7 +44,7 @@ Deno.serve(async (request) => {
     }
   }
 
-  // 4. Retrieve API Key Pool from Deno KV
+  // 4. Retrieve Key Pool
   const keysEntry = await kv.get(["config", "keys"]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
 
@@ -54,7 +53,7 @@ Deno.serve(async (request) => {
     request.headers.get("x-goog-api-key") ||
     request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
 
-  const adminPassword = Deno.env.get("ADMIN_PASSWORD") || "admin";
+  const adminPassword = Deno.env.get("ADMIN_PASSWORD") || "1234";
   let candidateKeys = [];
   if (clientKey && clientKey !== adminPassword && clientKey !== "sk-test" && clientKey !== "sk-proxy") {
     candidateKeys.push(clientKey);
@@ -63,12 +62,12 @@ Deno.serve(async (request) => {
 
   if (candidateKeys.length === 0) {
     return new Response(
-      JSON.stringify({ error: { message: "No API keys configured. Please add keys via the /admin dashboard." } }),
+      JSON.stringify({ error: { message: "No API keys configured. Add keys via /admin dashboard." } }),
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
 
-  // 5. Dispatch Request
+  // 5. Dispatch
   if (isOpenAIFormat && url.pathname.includes("/chat/completions")) {
     return handleOpenAIChat(request, candidateKeys, TARGET_HOST);
   }
@@ -130,14 +129,19 @@ async function handleOpenAIChat(request, candidateKeys, targetHost) {
     targetUrl.searchParams.set("key", currentKey);
     if (stream) targetUrl.searchParams.set("alt", "sse");
 
+    // Clean outbound headers without client IP/country metadata
+    const cleanHeaders = {
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    };
+
     try {
       const response = await fetch(targetUrl.toString(), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: cleanHeaders,
         body: JSON.stringify(geminiPayload),
       });
 
-      // Handle Rate Limiting (429 / 403 / 503) -> 60s cooldown
       if ([429, 403, 503].includes(response.status)) {
         await kv.set(["cooldown", currentKey.slice(-8), model], "1", { expireIn: 60000 });
         lastResponse = response;
@@ -179,6 +183,11 @@ async function handleOpenAIChat(request, candidateKeys, targetHost) {
     } catch (_err) {
       if (i < keysToTry.length - 1) continue;
     }
+  }
+
+  if (lastResponse) {
+    const errText = await lastResponse.text();
+    return new Response(errText, { status: lastResponse.status, headers: { "Content-Type": "application/json" } });
   }
 
   return new Response(
@@ -349,13 +358,16 @@ async function handleGeminiNative(request, candidateKeys, targetHost, url, model
     targetUrl.port = "";
     targetUrl.searchParams.set("key", currentKey);
 
-    const modifiedHeaders = new Headers(request.headers);
-    modifiedHeaders.set("Host", targetHost);
-    modifiedHeaders.set("x-goog-api-key", currentKey);
+    // Strip client headers (x-forwarded-for, cf-connecting-ip, etc.)
+    const cleanHeaders = new Headers();
+    const contentType = request.headers.get("content-type");
+    if (contentType) cleanHeaders.set("Content-Type", contentType);
+    cleanHeaders.set("x-goog-api-key", currentKey);
+    cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
 
     const targetRequest = new Request(targetUrl.toString(), {
       method: request.method,
-      headers: modifiedHeaders,
+      headers: cleanHeaders,
       body: bodyBuffer ? bodyBuffer.slice(0) : null,
       redirect: "follow",
     });
@@ -429,7 +441,7 @@ async function appendIndex(keyPath, item) {
 
 async function handleAdminAPI(request, url) {
   const auth = request.headers.get("Authorization");
-  const expectedAuth = `Bearer ${Deno.env.get("ADMIN_PASSWORD") || "admin"}`;
+  const expectedAuth = `Bearer ${Deno.env.get("ADMIN_PASSWORD") || "1234"}`;
 
   if (!auth || auth !== expectedAuth) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -492,7 +504,7 @@ function renderAdminHTML() {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Gemini API Proxy Dashboard (Deno Deploy)</title>
+  <title>Gemini API Proxy Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
@@ -501,7 +513,7 @@ function renderAdminHTML() {
     <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-800 p-6 rounded-2xl border border-slate-700 gap-4 shadow-lg">
       <div>
         <h1 class="text-2xl font-bold text-sky-400">Gemini Proxy (Deno Deploy)</h1>
-        <p class="text-sm text-slate-400 mt-1">Multi-modal Vision · Geo-Bypass · Smart Key Rotation & Cooldown</p>
+        <p class="text-sm text-slate-400 mt-1">Direct Edge Relay · Multi-key Rotation · Header Stripping</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-sky-500">
@@ -509,29 +521,29 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Client Base URL Endpoint Card -->
+    <!-- Client Endpoints Card -->
     <div class="bg-slate-800/90 p-5 rounded-2xl border border-sky-900/60 shadow-md">
       <h2 class="text-sm font-semibold text-sky-400 mb-3">🔗 Client Endpoints (Base URL)</h2>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
         <div class="bg-slate-950/80 p-3.5 rounded-xl border border-slate-700 flex flex-col justify-between">
           <div>
             <div class="flex justify-between items-center mb-1">
-              <span class="text-slate-400 font-medium">OpenAI Compatible (Cline, Continue, ChatBox)</span>
+              <span class="text-slate-400 font-medium">OpenAI Compatible (Cline, Roo Code, Continue)</span>
               <button onclick="copyToClip('openaiUrl', this)" class="text-sky-400 hover:text-sky-300 font-medium">Copy</button>
             </div>
             <div id="openaiUrl" class="font-mono text-emerald-400 text-sm break-all select-all">Loading...</div>
           </div>
-          <div class="text-[11px] text-slate-500 mt-2">API Key: Any placeholder string (e.g. sk-proxy)</div>
+          <div class="text-[11px] text-slate-500 mt-2">API Key: Any string (e.g. sk-proxy)</div>
         </div>
         <div class="bg-slate-950/80 p-3.5 rounded-xl border border-slate-700 flex flex-col justify-between">
           <div>
             <div class="flex justify-between items-center mb-1">
-              <span class="text-slate-400 font-medium">Gemini Native Endpoint (Google SDK)</span>
+              <span class="text-slate-400 font-medium">Gemini Native Endpoint (SDK)</span>
               <button onclick="copyToClip('geminiUrl', this)" class="text-sky-400 hover:text-sky-300 font-medium">Copy</button>
             </div>
             <div id="geminiUrl" class="font-mono text-emerald-400 text-sm break-all select-all">Loading...</div>
           </div>
-          <div class="text-[11px] text-slate-500 mt-2">Supports native Gemini REST routes</div>
+          <div class="text-[11px] text-slate-500 mt-2">Supports native Google Gemini REST</div>
         </div>
       </div>
     </div>
@@ -540,7 +552,7 @@ function renderAdminHTML() {
     <div class="bg-slate-800 p-6 rounded-2xl border border-slate-700 shadow-md">
       <h2 class="text-lg font-semibold text-slate-200 mb-4">📊 Model Usage Metrics</h2>
       <div id="modelList" class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div class="text-slate-500 text-sm">Please enter password and refresh to load metrics...</div>
+        <div class="text-slate-500 text-sm">Please login and refresh to view metrics...</div>
       </div>
     </div>
 
