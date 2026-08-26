@@ -3,10 +3,10 @@
  * Providers: Google Gemini & Agnes AI
  * 
  * Features:
- *  - Native Model Isolation (agnes-2.5-flash, gemini-*)
- *  - Virtual Auto-Switch Model (mixed-lite) with deep payload rewriting
- *  - Error Count tracking per key
- *  - Real-time Quota Dashboard with RPM / TPM / RPD / Error metrics
+ *  - Fixed: Agnes 2.5 Flash is strictly prioritized in mixed-lite
+ *  - Fixed: Client header sanitization (no key leak/pollution)
+ *  - Virtual Fallback: agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash
+ *  - Error Count tracking & Google AI Studio Style 4-Metric Live Dashboard
  */
 
 const kv = await Deno.openKv();
@@ -17,7 +17,6 @@ const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 const AGNES_RPM_LIMIT = 10;
 const AGNES_RPD_LIMIT = 250;
 
-// Model definitions and quota specifications
 const MODEL_CATALOG = {
   "mixed-lite": {
     name: "Mixed-Lite (Virtual Auto-Failover)",
@@ -25,7 +24,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "自動備援混合模型：Agnes 2.5 -> Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0 順序無縫切換",
+    desc: "優先使用 Agnes 2.5 Flash，限流/故障時自動依序切換 Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -133,7 +132,6 @@ async function executeMixedLiteChain(request, url, requestJson) {
   let lastResponse = null;
 
   for (const step of MIXED_LITE_CHAIN) {
-    // Dynamic payload rewriting with deep clone
     let activeBuffer = null;
     if (requestJson) {
       const cloned = JSON.parse(JSON.stringify(requestJson));
@@ -146,6 +144,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
       const resHeaders = new Headers(res.headers);
       resHeaders.set("X-Virtual-Model", "mixed-lite");
       resHeaders.set("X-Resolved-Model", step.model);
+      resHeaders.set("X-Provider-Used", step.provider);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers: resHeaders });
     }
     if (res) lastResponse = res;
@@ -181,22 +180,14 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
   const today = new Date().toISOString().split("T")[0];
   const currentMinute = Math.floor(Date.now() / 60000);
 
+  // 僅讀取該 Provider 專屬配置的 Key 池
   const keysEntry = await kv.get(["config", "keys", provider]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
 
-  const clientKey =
-    url.searchParams.get("key") ||
-    request.headers.get("x-goog-api-key") ||
-    request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+  if (keyPool.length === 0) return null;
 
-  let candidateKeys = [];
-  if (clientKey && clientKey !== ADMIN_PASSWORD && clientKey !== "sk-test" && clientKey !== "sk-proxy") {
-    candidateKeys.push(clientKey);
-  }
-  const shuffledPool = [...keyPool.filter((k) => k !== clientKey)].sort(() => Math.random() - 0.5);
-  candidateKeys.push(...shuffledPool);
-
-  if (candidateKeys.length === 0) return null;
+  // 隨機打散負載均衡
+  const candidateKeys = [...keyPool].sort(() => Math.random() - 0.5);
 
   const usableKeys = [];
   for (const k of candidateKeys) {
@@ -216,10 +207,20 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (usableKeys.length === 0) return null;
 
+  // 目標路徑與主機標準化
   const targetHost = provider === "agnes" ? DEFAULT_AGNES_HOST : GOOGLE_TARGET_HOST;
   let targetPath = url.pathname;
-  if (provider === "gemini" && url.pathname.startsWith("/v1/")) {
-    targetPath = "/v1beta/openai" + url.pathname;
+
+  if (provider === "agnes") {
+    if (!targetPath.startsWith("/v1/")) {
+      targetPath = "/v1" + targetPath;
+    }
+  } else if (provider === "gemini") {
+    if (targetPath.startsWith("/v1/")) {
+      targetPath = "/v1beta/openai" + targetPath;
+    } else {
+      targetPath = "/v1beta/openai/v1" + targetPath;
+    }
   }
 
   for (let i = 0; i < usableKeys.length; i++) {
@@ -229,8 +230,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     if (provider !== "agnes") targetUrl.searchParams.set("key", currentKey);
 
     const cleanHeaders = new Headers();
-    const contentType = request.headers.get("content-type");
-    if (contentType) cleanHeaders.set("Content-Type", contentType);
+    cleanHeaders.set("Content-Type", request.headers.get("content-type") || "application/json");
     cleanHeaders.set("Authorization", `Bearer ${currentKey}`);
     if (provider !== "agnes") cleanHeaders.set("x-goog-api-key", currentKey);
     cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
@@ -246,7 +246,7 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
     try {
       const response = await fetch(targetReq);
 
-      if ([429, 403, 500, 502, 503, 504].includes(response.status)) {
+      if ([401, 403, 429, 500, 502, 503, 504].includes(response.status)) {
         await recordErrorAtomic(provider, currentKey);
         await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
         if (i < usableKeys.length - 1) continue;
@@ -429,12 +429,11 @@ function renderAdminHTML() {
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-6 font-sans antialiased">
   <div class="max-w-6xl mx-auto space-y-6">
-    <!-- Header -->
     <div class="flex flex-col md:flex-row justify-between md:items-center bg-slate-900/90 p-6 rounded-2xl border border-slate-800 gap-4 shadow-xl backdrop-blur-sm">
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">4-Metric Live</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Agnes First</span>
         </div>
         <p class="text-sm text-slate-400 mt-1">RPM (分請求) · TPM (分 Token) · RPD (日請求) · Errors (錯誤統計)</p>
       </div>
