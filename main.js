@@ -1,11 +1,11 @@
 /**
- * Ultra-Stable AI Proxy & Google AI Studio Style Dashboard
+ * Production Proxy for Deno Deploy with Live 429 Cooldown Countdown & AI Studio Quota Monitor
  * Providers: Google Gemini & Agnes AI
  * Features:
- *  - Full Model Catalog List with 3 Quota Dimensions (RPM, TPM, RPD)
+ *  - Live Dynamic Countdown for 429 Cooldowns (Front-end & Server-side timestamp validation)
+ *  - 3-Dimension Rate Limit Monitor: RPM, TPM, RPD
  *  - Virtual Fallback Model: mixed-lite (agnes-2.5-flash -> gemini-3.5-flash-lite -> gemini-3.0-flash -> gemini-2.5-flash -> gemini-2.0-flash)
- *  - Exact Rate Limit Enforced & Atomic KV Tracking
- *  - Header Sanitization & Compression Fix
+ *  - Atomic KV Analytics & Geo-Bypass Header Scrubbing
  */
 
 const kv = await Deno.openKv();
@@ -13,7 +13,6 @@ const GOOGLE_TARGET_HOST = "generativelanguage.googleapis.com";
 const DEFAULT_AGNES_HOST = Deno.env.get("AGNES_HOST") || "api.agnes.ai";
 const ADMIN_PASSWORD = Deno.env.get("ADMIN_PASSWORD") || "1234";
 
-// 官方/推薦模型元數據與 Google 三大限額定義 (Free Tier 標準)
 const MODEL_CATALOG = {
   "mixed-lite": {
     name: "Mixed-Lite (Virtual Auto-Failover)",
@@ -21,7 +20,7 @@ const MODEL_CATALOG = {
     rpmLimit: "Adaptive (10-30)",
     tpmLimit: "250K - 1M",
     rpdLimit: "Aggregated (250+)",
-    desc: "極致穩定混合模型，按 Agnes -> Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0 自動階梯式切換",
+    desc: "Auto failover chain: Agnes 2.5 Flash -> Gemini 3.5 Lite -> 3.0 -> 2.5 -> 2.0",
   },
   "agnes-2.5-flash": {
     name: "Agnes 2.5 Flash",
@@ -29,7 +28,7 @@ const MODEL_CATALOG = {
     rpmLimit: 10,
     tpmLimit: "250,000",
     rpdLimit: 250,
-    desc: "Agnes 旗艦多模態模型，嚴格限制 10 RPM / 250 RPD",
+    desc: "Agnes Multimodal Flagship (10 RPM / 250 RPD enforced)",
   },
   "gemini-3.5-flash-lite": {
     name: "Gemini 3.5 Flash-Lite",
@@ -37,7 +36,7 @@ const MODEL_CATALOG = {
     rpmLimit: 30,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "次世代超輕量高併發模型，極速回應與除錯首選",
+    desc: "Ultra lightweight high-concurrency model",
   },
   "gemini-3.0-flash": {
     name: "Gemini 3.0 Flash",
@@ -45,7 +44,7 @@ const MODEL_CATALOG = {
     rpmLimit: 15,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "Gemini 3.0 標準推理模型，效能與速度平衡",
+    desc: "Gemini 3.0 balanced reasoning model",
   },
   "gemini-2.5-flash": {
     name: "Gemini 2.5 Flash",
@@ -53,7 +52,7 @@ const MODEL_CATALOG = {
     rpmLimit: 15,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "穩定主力 Flash 模型，具備長上下文與優秀程式編寫能力",
+    desc: "Workhorse model with long context & tool calling",
   },
   "gemini-2.0-flash": {
     name: "Gemini 2.0 Flash",
@@ -61,7 +60,7 @@ const MODEL_CATALOG = {
     rpmLimit: 15,
     tpmLimit: "1,000,000",
     rpdLimit: 1500,
-    desc: "高相容性備援模型，支援多模態與高吞吐",
+    desc: "High-compatibility fast fallback model",
   },
 };
 
@@ -88,7 +87,7 @@ Deno.serve(async (request) => {
     });
   }
 
-  // 2. 後台面板
+  // 2. Dashboard & API Endpoints
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -96,12 +95,12 @@ Deno.serve(async (request) => {
     return handleAdminAPI(request, url);
   }
 
-  // 3. /v1/models 模型清單
+  // 3. /v1/models
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return handleModelsList();
   }
 
-  // 4. 解析請求 Body
+  // 4. Parse Request
   let bodyBuffer = null;
   let requestedModel = "mixed-lite";
   let requestJson = null;
@@ -114,12 +113,11 @@ Deno.serve(async (request) => {
     } catch (_e) {}
   }
 
-  // 5. mixed-lite 虛擬模型調度
+  // 5. Model Routing
   if (requestedModel === "mixed-lite") {
     return await executeMixedLiteChain(request, url, requestJson);
   }
 
-  // 6. 原生獨立模型調度
   const isAgnes = requestedModel.toLowerCase().startsWith("agnes");
   const provider = isAgnes ? "agnes" : "gemini";
   return await executeSingleModel(request, url, bodyBuffer, requestedModel, provider);
@@ -147,7 +145,7 @@ async function executeMixedLiteChain(request, url, requestJson) {
   return new Response(
     JSON.stringify({
       error: {
-        message: "All fallback tiers for [mixed-lite] have been exhausted. Please check keys in /admin.",
+        message: "All fallback tiers for [mixed-lite] have been exhausted. Please verify API keys in /admin.",
       },
     }),
     { status: 429, headers: { "Content-Type": "application/json" } }
@@ -161,7 +159,7 @@ async function executeSingleModel(request, url, bodyBuffer, targetModel, provide
   return new Response(
     JSON.stringify({
       error: {
-        message: `All keys for model [${targetModel}] have reached the total limit or are in cooldown.`,
+        message: `All keys for model [${targetModel}] have reached the limit or are cooling down.`,
       },
     }),
     { status: 429, headers: { "Content-Type": "application/json" } }
@@ -169,8 +167,9 @@ async function executeSingleModel(request, url, bodyBuffer, targetModel, provide
 }
 
 async function attemptForward(request, url, bodyBuffer, targetModel, provider, isFallbackMode) {
+  const now = Date.now();
   const today = new Date().toISOString().split("T")[0];
-  const currentMinute = Math.floor(Date.now() / 60000);
+  const currentMinute = Math.floor(now / 60000);
 
   const keysEntry = await kv.get(["config", "keys", provider]);
   const keyPool = keysEntry.value ? JSON.parse(keysEntry.value) : [];
@@ -189,11 +188,15 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
 
   if (candidateKeys.length === 0) return null;
 
+  // Filter keys by validating cooldown timestamp and quotas
   const usableKeys = [];
   for (const k of candidateKeys) {
     const tail = k.slice(-8);
-    const cooldown = await kv.get(["cooldown", tail]);
-    if (cooldown.value) continue;
+    const cooldownEntry = await kv.get(["cooldown_until", tail]);
+    const cooldownUntil = parseInt(cooldownEntry.value || "0", 10);
+
+    // Active cooldown check: lock only if timestamp is in the future
+    if (cooldownUntil > now) continue;
 
     if (provider === "agnes") {
       const rpdCount = parseInt((await kv.get(["usage", "agnes", "key", tail, "today", today])).value || "0", 10);
@@ -238,7 +241,9 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       const response = await fetch(targetReq);
 
       if ([429, 403, 503].includes(response.status)) {
-        await kv.set(["cooldown", tail], "1", { expireIn: 60000 });
+        // Store explicit epoch timestamp for 60s cooldown
+        const unlockTime = Date.now() + 60000;
+        await kv.set(["cooldown_until", tail], unlockTime.toString(), { expireIn: 65000 });
         if (i < usableKeys.length - 1) continue;
         if (isFallbackMode) return null;
       }
@@ -250,7 +255,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
       resHeaders.delete("content-encoding");
 
       if (response.ok) {
-        // 推估或記錄 Token 數 (約 800 tokens per request)
         const estimatedTokens = 800;
         recordUsageAtomic(provider, currentKey, targetModel, estimatedTokens);
 
@@ -331,8 +335,9 @@ async function handleAdminAPI(request, url) {
   }
 
   if (url.pathname === "/api/admin/data" && request.method === "GET") {
+    const now = Date.now();
     const today = new Date().toISOString().split("T")[0];
-    const currentMinute = Math.floor(Date.now() / 60000);
+    const currentMinute = Math.floor(now / 60000);
 
     const getStats = async (provider) => {
       const rawKeys = (await kv.get(["config", "keys", provider])).value || "[]";
@@ -343,7 +348,11 @@ async function handleAdminAPI(request, url) {
         const tail = fullKey.slice(-8);
         const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
         const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
-        const cooldown = (await kv.get(["cooldown", tail])).value ? true : false;
+
+        const cooldownEntry = await kv.get(["cooldown_until", tail]);
+        const cooldownUntil = parseInt(cooldownEntry.value || "0", 10);
+        const remainingSeconds = Math.max(0, Math.ceil((cooldownUntil - now) / 1000));
+
         const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
         const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
@@ -354,11 +363,11 @@ async function handleAdminAPI(request, url) {
           total: totalCount,
           currentRPM: currentRPM,
           currentTPM: currentTPM,
-          inCooldown: cooldown,
+          cooldownUntil: cooldownUntil,
+          remainingSeconds: remainingSeconds,
         });
       }
 
-      // 模型統計
       const modelStats = {};
       for (const m of Object.keys(MODEL_CATALOG)) {
         const todayCount = (await kv.get(["usage", provider, "model", m, "today", today])).value || "0";
@@ -376,6 +385,7 @@ async function handleAdminAPI(request, url) {
 
     return new Response(
       JSON.stringify({
+        serverTime: now,
         date: today,
         catalog: MODEL_CATALOG,
         agnes: await getStats("agnes"),
@@ -413,9 +423,9 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">3-Metric Live</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Active Countdown</span>
         </div>
-        <p class="text-sm text-slate-400 mt-1">Google AI Studio Style: RPM (分請求) · TPM (分 Token) · RPD (日請求)</p>
+        <p class="text-sm text-slate-400 mt-1">RPM · TPM · RPD Live Quotas & Automatic 429 Cooldown Ticker</p>
       </div>
       <div class="flex gap-2">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
@@ -423,13 +433,13 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 1: Model Catalog & 3 Rate Limit Dimensions -->
+    <!-- Models List -->
     <div class="space-y-3">
       <div class="flex justify-between items-center px-1">
         <h2 class="text-lg font-bold text-slate-200 flex items-center gap-2">
-          <span>📋</span> 可用模型清單與三大限額指標 (All Available Models)
+          <span>📋</span> 可用模型清單與限額指標 (All Available Models)
         </h2>
-        <span class="text-xs text-slate-500">Google AI Studio Free Tier Quota Specification</span>
+        <span class="text-xs text-slate-500">Google AI Studio Free Tier Specification</span>
       </div>
 
       <div id="modelCatalogGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -437,7 +447,7 @@ function renderAdminHTML() {
       </div>
     </div>
 
-    <!-- Section 2: Key Pool Management & Live Quota Consumption -->
+    <!-- Key Pool Table -->
     <div class="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl space-y-4">
       <div class="flex flex-col md:flex-row justify-between md:items-center gap-4 border-b border-slate-800 pb-4">
         <div class="flex gap-2">
@@ -450,16 +460,15 @@ function renderAdminHTML() {
         </div>
       </div>
 
-      <!-- Key Pool Table -->
       <div class="overflow-x-auto">
         <table class="w-full text-left text-sm">
           <thead class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-800/80">
             <tr>
               <th class="py-3 px-2">Key 遮罩</th>
-              <th class="py-3 px-2">即時狀態</th>
-              <th class="py-3 px-2">即時 RPM (分請求)</th>
-              <th class="py-3 px-2">即時 TPM (分 Token)</th>
-              <th class="py-3 px-2">今日 RPD (日請求)</th>
+              <th class="py-3 px-2">即時狀態 (429 倒數)</th>
+              <th class="py-3 px-2">即時 RPM</th>
+              <th class="py-3 px-2">即時 TPM</th>
+              <th class="py-3 px-2">今日 RPD</th>
               <th class="py-3 px-2">歷史累計</th>
               <th class="py-3 px-2 text-right">操作</th>
             </tr>
@@ -493,6 +502,26 @@ function renderAdminHTML() {
       const saved = localStorage.getItem('deno_proxy_pwd');
       if(saved) document.getElementById('pwdInput').value = saved;
       fetchData();
+
+      // 1-second auto ticker for real-time countdown decrement
+      setInterval(() => {
+        const now = Date.now();
+        let needsUpdate = false;
+        ['agnes', 'gemini'].forEach(prov => {
+          if (globalData[prov] && globalData[prov].keys) {
+            globalData[prov].keys.forEach(k => {
+              if (k.cooldownUntil && k.cooldownUntil > now) {
+                k.remainingSeconds = Math.max(0, Math.ceil((k.cooldownUntil - now) / 1000));
+                needsUpdate = true;
+              } else if (k.remainingSeconds > 0) {
+                k.remainingSeconds = 0;
+                needsUpdate = true;
+              }
+            });
+          }
+        });
+        if (needsUpdate) renderKeyPool();
+      }, 1000);
     };
 
     async function fetchData() {
@@ -537,7 +566,6 @@ function renderAdminHTML() {
             <p class="text-xs text-slate-400 mb-4 line-clamp-2">\${meta.desc}</p>
           </div>
 
-          <!-- 3 Google Dimensions -->
           <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 space-y-2 text-xs">
             <div class="flex justify-between items-center">
               <span class="text-slate-400">1. RPM (分請求上限)</span>
@@ -572,8 +600,8 @@ function renderAdminHTML() {
 
       tbody.innerHTML = pData.keys.map((k, idx) => {
         let statusBadge = '<span class="text-emerald-400 text-xs px-2.5 py-1 rounded-full bg-emerald-950/70 border border-emerald-800/80">正常 (Active)</span>';
-        if (k.inCooldown) {
-          statusBadge = '<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/70 border border-amber-800/80">429 冷卻中 (60s)</span>';
+        if (k.remainingSeconds && k.remainingSeconds > 0) {
+          statusBadge = \`<span class="text-amber-400 text-xs px-2.5 py-1 rounded-full bg-amber-950/80 border border-amber-700/80 font-mono animate-pulse">429 冷卻中 (\${k.remainingSeconds}s)</span>\`;
         }
 
         return \`
