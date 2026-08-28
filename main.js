@@ -69,23 +69,31 @@ const MIXED_LITE_CHAIN = [
 ];
 
 async function isModelDisabled(modelId) {
-  const res = await kv.get(["config", "disabled_models"]);
-  const list = res.value ? JSON.parse(res.value) : [];
-  return list.includes(modelId);
+  try {
+    const res = await kv.get(["config", "disabled_models"]);
+    const list = res.value ? JSON.parse(res.value) : [];
+    return list.includes(modelId);
+  } catch (_e) {
+    return false;
+  }
 }
 
 async function isKeyInCooldown(keyTail) {
-  const cooldownRes = await kv.get(["cooldown", keyTail]);
-  if (!cooldownRes.value) return false;
+  try {
+    const cooldownRes = await kv.get(["cooldown", keyTail]);
+    if (!cooldownRes.value) return false;
 
-  const expireTime = parseInt(cooldownRes.value, 10);
-  const now = Date.now();
+    const expireTime = parseInt(cooldownRes.value, 10);
+    const now = Date.now();
 
-  if (now >= expireTime) {
-    await kv.delete(["cooldown", keyTail]);
+    if (now >= expireTime) {
+      await kv.delete(["cooldown", keyTail]);
+      return false;
+    }
+    return true;
+  } catch (_e) {
     return false;
   }
-  return true;
 }
 
 Deno.serve(async (request) => {
@@ -143,8 +151,11 @@ Deno.serve(async (request) => {
 
 async function executeMixedLiteChain(request, url, requestJson) {
   let lastResponse = null;
-  const resDisabled = await kv.get(["config", "disabled_models"]);
-  const disabledList = resDisabled.value ? JSON.parse(resDisabled.value) : [];
+  let disabledList = [];
+  try {
+    const resDisabled = await kv.get(["config", "disabled_models"]);
+    disabledList = resDisabled.value ? JSON.parse(resDisabled.value) : [];
+  } catch (_e) {}
 
   for (let i = 0; i < MIXED_LITE_CHAIN.length; i++) {
     const step = MIXED_LITE_CHAIN[i];
@@ -250,7 +261,6 @@ async function attemptForward(request, url, bodyBuffer, targetModel, provider, i
   let targetHost = AGNES_TARGET_HOST;
   let targetPath = url.pathname;
 
-  // 正確對齊 Base URL 路徑
   if (provider === "agnes") {
     targetHost = AGNES_TARGET_HOST;
     let cleanPath = url.pathname;
@@ -356,45 +366,51 @@ function handleModelsList() {
 }
 
 async function recordUsageAtomic(provider, key, model, tokens) {
-  const today = new Date().toISOString().split("T")[0];
-  const keyTail = key.slice(-8);
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const keyTail = key.slice(-8);
 
-  const kToday = ["usage", provider, "key", keyTail, "today", today];
-  const kTotal = ["usage", provider, "key", keyTail, "total"];
-  const mToday = ["usage", provider, "model", model, "today", today];
-  const mTotal = ["usage", provider, "model", model, "total"];
-  const mTokensToday = ["tokens", provider, "model", model, "today", today];
+    const kToday = ["usage", provider, "key", keyTail, "today", today];
+    const kTotal = ["usage", provider, "key", keyTail, "total"];
+    const mToday = ["usage", provider, "model", model, "today", today];
+    const mTotal = ["usage", provider, "model", model, "total"];
+    const mTokensToday = ["tokens", provider, "model", model, "today", today];
 
-  const [resKT, resKAll, resMT, resMAll, resToken] = await kv.getMany([kToday, kTotal, mToday, mTotal, mTokensToday]);
+    const [resKT, resKAll, resMT, resMAll, resToken] = await kv.getMany([kToday, kTotal, mToday, mTotal, mTokensToday]);
 
-  await kv.atomic()
-    .set(kToday, (parseInt(resKT.value || "0", 10) + 1).toString())
-    .set(kTotal, (parseInt(resKAll.value || "0", 10) + 1).toString())
-    .set(mToday, (parseInt(resMT.value || "0", 10) + 1).toString())
-    .set(mTotal, (parseInt(resMAll.value || "0", 10) + 1).toString())
-    .set(mTokensToday, (parseInt(resToken.value || "0", 10) + tokens).toString())
-    .commit();
+    await kv.atomic()
+      .set(kToday, (parseInt(resKT.value || "0", 10) + 1).toString())
+      .set(kTotal, (parseInt(resKAll.value || "0", 10) + 1).toString())
+      .set(mToday, (parseInt(resMT.value || "0", 10) + 1).toString())
+      .set(mTotal, (parseInt(resMAll.value || "0", 10) + 1).toString())
+      .set(mTokensToday, (parseInt(resToken.value || "0", 10) + tokens).toString())
+      .commit();
+  } catch (_e) {}
 }
 
 async function recordErrorAtomic(provider, key) {
-  const keyTail = key.slice(-8);
-  const errKey = ["errors", provider, keyTail];
-  const res = await kv.get(errKey);
-  const count = parseInt(res.value || "0", 10) + 1;
-  await kv.set(errKey, count.toString());
+  try {
+    const keyTail = key.slice(-8);
+    const errKey = ["errors", provider, keyTail];
+    const res = await kv.get(errKey);
+    const count = parseInt(res.value || "0", 10) + 1;
+    await kv.set(errKey, count.toString());
+  } catch (_e) {}
 }
 
 async function appendLog(event) {
-  const logEntry = {
-    time: new Date().toLocaleTimeString(),
-    type: event.type,
-    message: event.message,
-  };
-  const res = await kv.get(["system", "logs"]);
-  let logs = res.value ? JSON.parse(res.value) : [];
-  logs.unshift(logEntry);
-  if (logs.length > 50) logs = logs.slice(0, 50);
-  await kv.set(["system", "logs"], JSON.stringify(logs));
+  try {
+    const logEntry = {
+      time: new Date().toLocaleTimeString(),
+      type: event.type,
+      message: event.message,
+    };
+    const res = await kv.get(["system", "logs"]);
+    let logs = res.value ? JSON.parse(res.value) : [];
+    logs.unshift(logEntry);
+    if (logs.length > 50) logs = logs.slice(0, 50);
+    await kv.set(["system", "logs"], JSON.stringify(logs));
+  } catch (_e) {}
 }
 
 async function handleAdminAPI(request, url) {
@@ -407,71 +423,86 @@ async function handleAdminAPI(request, url) {
   }
 
   if (url.pathname === "/api/admin/data" && request.method === "GET") {
-    const today = new Date().toISOString().split("T")[0];
-    const currentMinute = Math.floor(Date.now() / 60000);
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const currentMinute = Math.floor(Date.now() / 60000);
 
-    const disabledModelsRes = await kv.get(["config", "disabled_models"]);
-    const disabledModels = disabledModelsRes.value ? JSON.parse(disabledModelsRes.value) : [];
+      const disabledModelsRes = await kv.get(["config", "disabled_models"]);
+      const disabledModels = disabledModelsRes.value ? JSON.parse(disabledModelsRes.value) : [];
 
-    const getStats = async (provider) => {
-      const rawKeys = (await kv.get(["config", "keys", provider])).value || "[]";
-      const keyPool = JSON.parse(rawKeys);
+      const getStats = async (provider) => {
+        let keyPool = [];
+        let disabledKeys = [];
+        try {
+          const rawKeys = (await kv.get(["config", "keys", provider])).value || "[]";
+          keyPool = JSON.parse(rawKeys);
+        } catch (_e) {}
+        try {
+          const rawDisabledKeys = (await kv.get(["config", "disabled_keys", provider])).value || "[]";
+          disabledKeys = JSON.parse(rawDisabledKeys);
+        } catch (_e) {}
 
-      const rawDisabledKeys = (await kv.get(["config", "disabled_keys", provider])).value || "[]";
-      const disabledKeys = JSON.parse(rawDisabledKeys);
+        const keyStats = [];
+        for (const fullKey of keyPool) {
+          const tail = fullKey.slice(-8);
+          const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
+          const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
+          const errorCount = parseInt((await kv.get(["errors", provider, tail])).value || "0", 10);
+          const cooldown = await isKeyInCooldown(tail);
+          const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
+          const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
 
-      const keyStats = [];
-      for (const fullKey of keyPool) {
-        const tail = fullKey.slice(-8);
-        const todayCount = parseInt((await kv.get(["usage", provider, "key", tail, "today", today])).value || "0", 10);
-        const totalCount = parseInt((await kv.get(["usage", provider, "key", tail, "total"])).value || "0", 10);
-        const errorCount = parseInt((await kv.get(["errors", provider, tail])).value || "0", 10);
-        const cooldown = await isKeyInCooldown(tail);
-        const currentRPM = parseInt((await kv.get(["rpm", provider, tail, currentMinute])).value || "0", 10);
-        const currentTPM = parseInt((await kv.get(["tpm", provider, tail, currentMinute])).value || "0", 10);
+          keyStats.push({
+            key: fullKey,
+            masked: `...${tail}`,
+            today: todayCount,
+            total: totalCount,
+            errors: errorCount,
+            currentRPM: currentRPM,
+            currentTPM: currentTPM,
+            inCooldown: cooldown,
+            disabled: disabledKeys.includes(fullKey),
+          });
+        }
 
-        keyStats.push({
-          key: fullKey,
-          masked: `...${tail}`,
-          today: todayCount,
-          total: totalCount,
-          errors: errorCount,
-          currentRPM: currentRPM,
-          currentTPM: currentTPM,
-          inCooldown: cooldown,
-          disabled: disabledKeys.includes(fullKey),
-        });
-      }
+        const modelStats = {};
+        for (const m of Object.keys(MODEL_CATALOG)) {
+          const todayCount = (await kv.get(["usage", provider, "model", m, "today", today])).value || "0";
+          const totalCount = (await kv.get(["usage", provider, "model", m, "total"])).value || "0";
+          const tokensToday = (await kv.get(["tokens", provider, "model", m, "today", today])).value || "0";
+          modelStats[m] = {
+            today: parseInt(todayCount, 10),
+            total: parseInt(totalCount, 10),
+            tokensToday: parseInt(tokensToday, 10),
+          };
+        }
 
-      const modelStats = {};
-      for (const m of Object.keys(MODEL_CATALOG)) {
-        const todayCount = (await kv.get(["usage", provider, "model", m, "today", today])).value || "0";
-        const totalCount = (await kv.get(["usage", provider, "model", m, "total"])).value || "0";
-        const tokensToday = (await kv.get(["tokens", provider, "model", m, "today", today])).value || "0";
-        modelStats[m] = {
-          today: parseInt(todayCount, 10),
-          total: parseInt(totalCount, 10),
-          tokensToday: parseInt(tokensToday, 10),
-        };
-      }
+        return { keys: keyStats, modelStats: modelStats };
+      };
 
-      return { keys: keyStats, modelStats: modelStats };
-    };
+      let logs = [];
+      try {
+        const logsRes = await kv.get(["system", "logs"]);
+        logs = logsRes.value ? JSON.parse(logsRes.value) : [];
+      } catch (_e) {}
 
-    const logsRes = await kv.get(["system", "logs"]);
-    const logs = logsRes.value ? JSON.parse(logsRes.value) : [];
-
-    return new Response(
-      JSON.stringify({
-        date: today,
-        catalog: MODEL_CATALOG,
-        disabledModels: disabledModels,
-        agnes: await getStats("agnes"),
-        gemini: await getStats("gemini"),
-        logs: logs,
-      }),
-      { headers: { "Content-Type": "application/json" } }
-    );
+      return new Response(
+        JSON.stringify({
+          date: today,
+          catalog: MODEL_CATALOG,
+          disabledModels: disabledModels,
+          agnes: await getStats("agnes"),
+          gemini: await getStats("gemini"),
+          logs: logs,
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    } catch (err) {
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   }
 
   if (url.pathname === "/api/admin/keys" && request.method === "POST") {
@@ -541,7 +572,7 @@ function renderAdminHTML() {
       <div>
         <div class="flex items-center gap-2">
           <span class="text-2xl font-bold bg-gradient-to-r from-sky-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">AI Gateway & Quota Monitor</span>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Operational</span>
+          <span class="text-xs px-2.5 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800">Auto Active</span>
         </div>
         <p class="text-sm text-slate-400 mt-1">冷卻時間 60 秒到期自動解除 · 支援單獨模型與 Key 開關控制</p>
       </div>
@@ -658,13 +689,13 @@ function renderAdminHTML() {
     function renderCatalog() {
       const catalog = globalData.catalog || {};
       const disabledModels = globalData.disabledModels || [];
-      const stats = (globalData[activeProvider] && globalData[activeProvider].modelStats) || {};
+      const currentStats = (globalData[activeProvider] && globalData[activeProvider].modelStats) || {};
       const grid = document.getElementById('modelCatalogGrid');
       grid.innerHTML = '';
 
       for (const id in catalog) {
         const meta = catalog[id];
-        const mUsage = stats[id] || { today: 0, total: 0, tokensToday: 0 };
+        const mUsage = currentStats[id] || { today: 0, total: 0, tokensToday: 0 };
         const isVirtual = meta.provider === 'virtual';
         const isDisabled = disabledModels.includes(id);
 
@@ -713,10 +744,10 @@ function renderAdminHTML() {
 
         const bottomDiv = document.createElement('div');
         bottomDiv.className = 'bg-slate-950/70 p-3 rounded-xl border border-slate-800/80 space-y-2 text-xs';
-        bottomDiv.innerHTML = '<div class="flex justify-between items-center"><span class="text-slate-400">1. RPM (分請求上限)</span><span class="font-mono text-amber-400 font-semibold">' + meta.rpmLimit + ' req/min</span></div>' +
-          '<div class="flex justify-between items-center"><span class="text-slate-400">2. TPM (分 Token 上限)</span><span class="font-mono text-cyan-400 font-semibold">' + meta.tpmLimit + ' tokens</span></div>' +
-          '<div class="flex justify-between items-center"><span class="text-slate-400">3. RPD (日請求上限)</span><span class="font-mono text-emerald-400 font-semibold">' + meta.rpdLimit + ' req/day</span></div>' +
-          '<div class="pt-2 mt-2 border-t border-slate-800/60 flex justify-between text-[11px] text-slate-400"><span>今日累計: <b class="text-slate-200">' + mUsage.today + ' 次</b></span><span>歷史總計: <b class="text-slate-200">' + mUsage.total + ' 次</b></span></div>';
+        bottomDiv.innerHTML = '<div class="flex justify-between items-center"><span class="text-slate-400">1. RPM (分請求上限)</span><span class="font-mono text-amber-400 font-semibold">' + (meta.rpmLimit || '-') + ' req/min</span></div>' +
+          '<div class="flex justify-between items-center"><span class="text-slate-400">2. TPM (分 Token 上限)</span><span class="font-mono text-cyan-400 font-semibold">' + (meta.tpmLimit || '-') + ' tokens</span></div>' +
+          '<div class="flex justify-between items-center"><span class="text-slate-400">3. RPD (日請求上限)</span><span class="font-mono text-emerald-400 font-semibold">' + (meta.rpdLimit || '-') + ' req/day</span></div>' +
+          '<div class="pt-2 mt-2 border-t border-slate-800/60 flex justify-between text-[11px] text-slate-400"><span>今日累計: <b class="text-slate-200">' + (mUsage.today || 0) + ' 次</b></span><span>歷史總計: <b class="text-slate-200">' + (mUsage.total || 0) + ' 次</b></span></div>';
 
         card.appendChild(topDiv);
         card.appendChild(bottomDiv);
@@ -725,7 +756,7 @@ function renderAdminHTML() {
     }
 
     function renderKeyPool() {
-      const pData = globalData[activeProvider] || { keys: [] };
+      const pData = (globalData && globalData[activeProvider]) || { keys: [] };
       const tbody = document.getElementById('keyTableBody');
 
       if (!pData.keys || pData.keys.length === 0) {
@@ -749,13 +780,13 @@ function renderAdminHTML() {
         const tr = document.createElement('tr');
         tr.className = 'hover:bg-slate-800/30 transition ' + (k.disabled ? 'opacity-40' : '');
 
-        tr.innerHTML = '<td class="py-3 px-2 font-mono text-slate-300">' + k.masked + '</td>' +
+        tr.innerHTML = '<td class="py-3 px-2 font-mono text-slate-300">' + (k.masked || '...') + '</td>' +
           '<td class="py-3 px-2">' + statusBadge + '</td>' +
           '<td class="py-3 px-2 font-mono text-amber-400 font-semibold">' + (k.currentRPM || 0) + ' <span class="text-slate-500 text-xs font-normal">RPM</span></td>' +
           '<td class="py-3 px-2 font-mono text-cyan-400 font-semibold">' + (k.currentTPM || 0).toLocaleString() + ' <span class="text-slate-500 text-xs font-normal">TPM</span></td>' +
-          '<td class="py-3 px-2 font-mono text-emerald-400 font-semibold">' + k.today + ' <span class="text-slate-500 text-xs font-normal">RPD</span></td>' +
+          '<td class="py-3 px-2 font-mono text-emerald-400 font-semibold">' + (k.today || 0) + ' <span class="text-slate-500 text-xs font-normal">RPD</span></td>' +
           '<td class="py-3 px-2">' + errorBadge + '</td>' +
-          '<td class="py-3 px-2 font-mono text-slate-400">' + k.total + '</td>';
+          '<td class="py-3 px-2 font-mono text-slate-400">' + (k.total || 0) + '</td>';
 
         const actionTd = document.createElement('td');
         actionTd.className = 'py-3 px-2 text-right space-x-2';
@@ -826,7 +857,7 @@ function renderAdminHTML() {
     async function addKeyPrompt() {
       const key = prompt('輸入新的 API Key (' + activeProvider.toUpperCase() + '):');
       if (!key || !key.trim()) return;
-      const current = (globalData[activeProvider].keys || []).map(k => k.key);
+      const current = ((globalData[activeProvider] && globalData[activeProvider].keys) || []).map(k => k.key);
       current.push(key.trim());
       await saveKeys(current);
     }
@@ -834,8 +865,8 @@ function renderAdminHTML() {
     async function batchAddPrompt() {
       const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
       if (!text || !text.trim()) return;
-      const keys = text.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
-      const current = (globalData[activeProvider].keys || []).map(k => k.key);
+      const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
+      const current = ((globalData[activeProvider] && globalData[activeProvider].keys) || []).map(k => k.key);
       current.push(...keys);
       await saveKeys(current);
     }
