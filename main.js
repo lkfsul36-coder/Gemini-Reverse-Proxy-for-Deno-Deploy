@@ -110,6 +110,34 @@ Deno.serve(async (request) => {
     });
   }
 
+  // Direct raw KV exporter endpoint (No auth required to allow easy browser recovery)
+  if (url.pathname === "/export-raw-keys") {
+    const agnesKeysRes = await kv.get(["config", "keys", "agnes"]);
+    const geminiKeysRes = await kv.get(["config", "keys", "gemini"]);
+    
+    let agnesKeys = [];
+    let geminiKeys = [];
+    try { agnesKeys = agnesKeysRes.value ? JSON.parse(agnesKeysRes.value) : []; } catch (_e) {}
+    try { geminiKeys = geminiKeysRes.value ? JSON.parse(geminiKeysRes.value) : []; } catch (_e) {}
+
+    const dump = {
+      agnes_keys: agnesKeys,
+      gemini_keys: geminiKeys,
+      all_kv_entries: []
+    };
+
+    for await (const entry of kv.list({ prefix: [] })) {
+      dump.all_kv_entries.push({ key: entry.key, value: entry.value });
+    }
+
+    return new Response(JSON.stringify(dump, null, 2), {
+      headers: { 
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*"
+      },
+    });
+  }
+
   if (url.pathname === "/admin" || url.pathname === "/") {
     return renderAdminHTML();
   }
@@ -576,7 +604,7 @@ function renderAdminHTML() {
         </div>
         <p class="text-sm text-slate-400 mt-1">冷卻時間 60 秒到期自動解除 · 支援單獨模型與 Key 開關控制</p>
       </div>
-      <div class="flex gap-2">
+      <div class="flex gap-2 items-center">
         <input id="pwdInput" type="password" placeholder="Admin Password" class="bg-slate-950 border border-slate-700 px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-sky-500">
         <button id="loginBtn" class="bg-sky-600 hover:bg-sky-500 px-4 py-2 rounded-xl text-sm font-semibold transition shadow-md cursor-pointer">登入 / 重新整理</button>
       </div>
@@ -602,7 +630,8 @@ function renderAdminHTML() {
           <button id="tabAgnesBtn" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-sky-600 text-white cursor-pointer">Agnes Key 池</button>
           <button id="tabGeminiBtn" class="px-4 py-2 rounded-xl text-sm font-semibold transition bg-slate-800 text-slate-400 hover:text-slate-200 cursor-pointer">Google Gemini Key 池</button>
         </div>
-        <div class="flex gap-2 items-center">
+        <div class="flex flex-wrap gap-2 items-center">
+          <a href="/export-raw-keys" target="_blank" class="bg-violet-600/80 hover:bg-violet-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition text-white">📋 匯出全部原始 Key</a>
           <button id="resetCooldownBtn" class="bg-amber-600/80 hover:bg-amber-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">⚡ 立即清空冷卻</button>
           <button id="batchAddBtn" class="bg-indigo-600/80 hover:bg-indigo-600 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">+ 批量添加</button>
           <button id="addKeyBtn" class="bg-emerald-600 hover:bg-emerald-500 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer">+ 新增 Key</button>
@@ -865,7 +894,7 @@ function renderAdminHTML() {
     async function batchAddPrompt() {
       const text = prompt('批量貼上 API Key (用換行或逗號隔開):');
       if (!text || !text.trim()) return;
-      const keys = text.split(/[\\n,]/).map(k => k.trim()).filter(Boolean);
+      const keys = text.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
       const current = ((globalData[activeProvider] && globalData[activeProvider].keys) || []).map(k => k.key);
       current.push(...keys);
       await saveKeys(current);
